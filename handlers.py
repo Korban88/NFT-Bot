@@ -29,7 +29,7 @@ async def about_collection(message: types.Message):
     text = (
         f"**{COLLECTION_NAME}** — первая серия в концепции «Поле и свет».\n"
         f"Стандарт: 1155 • Тикер: {COLLECTION_SYMBOL}\n\n"
-        "Iteration 0: минт с заглушкой оплаты. На следующем шаге добавим реальный non‑custodial минт в TON "
+        "Iteration 0: минт с заглушкой оплаты. На следующем шаге добавим реальный non-custodial минт в TON "
         "и хранение медиа на IPFS."
     )
     await message.answer(text, parse_mode="Markdown")
@@ -81,11 +81,11 @@ async def cb_mint(call: types.CallbackQuery):
         db.commit()
         order_id = order.id
 
-    await call.message.edit_reply_markup()
+    await call.message.edit_reply_markup()  # убираем кнопки
     await call.message.answer(
         "Заказ создан ✅\n"
         f"ID заказа: #{order_id}\n\n"
-        "Сейчас это заглушка. На следующей итерации появится non‑custodial подпись в кошельке и автоматическая проверка статуса.",
+        "Сейчас это заглушка. На следующей итерации появится non-custodial подпись в кошельке и автоматическая проверка статуса.",
     )
     await call.answer()
 
@@ -99,5 +99,5 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(about_collection, lambda m: m.text and m.text.lower().startswith("о коллекции"))
     dp.register_message_handler(my_profile, lambda m: m.text and m.text.lower().startswith("мой профиль"))
     dp.register_message_handler(buy_nft, lambda m: m.text and m.text.lower().startswith("купить nft"))
-    dp.register_callback_query_handler(cb_mint, text_in=["mint_usdt", "mint_ton"])
+    dp.register_callback_query_handler(cb_mint, text=["mint_usdt", "mint_ton"])
     dp.register_message_handler(admin_ping, commands=["admin_ping"])
