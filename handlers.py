@@ -4,6 +4,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
+from urllib.parse import quote
 
 import httpx
 import asyncpg
@@ -19,7 +20,7 @@ TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 MIN_PAYMENT_TON = float(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON
 TON_DECIMALS = 10**9  # nanotons per TON
 
-# ======== Keyboards ========
+# ======== Keyboards/Links ========
 def main_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("Купить NFT"))
@@ -27,13 +28,27 @@ def main_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton("Мой профиль"))
     return kb
 
-def pay_kb(link: str) -> InlineKeyboardMarkup:
+def build_ton_transfer_link(address: str, amount_ton: float, comment: str) -> str:
+    amount_nanotons = int(amount_ton * TON_DECIMALS)
+    safe_comment = comment[:120]
+    return f"ton://transfer/{address}?amount={amount_nanotons}&text={safe_comment}"
+
+def build_tonkeeper_link(address: str, amount_ton: float, comment: str) -> str:
+    amount_nanotons = int(amount_ton * TON_DECIMALS)
+    return f"https://app.tonkeeper.com/transfer/{address}?amount={amount_nanotons}&text={quote(comment)}"
+
+def build_tonhub_link(address: str, amount_ton: float, comment: str) -> str:
+    amount_nanotons = int(amount_ton * TON_DECIMALS)
+    return f"https://tonhub.com/transfer/{address}?amount={amount_nanotons}&text={quote(comment)}"
+
+def pay_kb(ton_link: str, tk_link: str, th_link: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(text="Оплатить в TON", url=link))
+    kb.add(InlineKeyboardButton(text="Оплатить в TON (mobile)", url=ton_link))
+    kb.add(InlineKeyboardButton(text="Tonkeeper (web)", url=tk_link))
+    kb.add(InlineKeyboardButton(text="Tonhub (web)", url=th_link))
     return kb
 
 # ======== DB helpers ========
-# Свои таблицы, чтобы не конфликтовать с чужими
 CREATE_APP_PAYMENTS_SQL = """
 CREATE TABLE IF NOT EXISTS app_payments (
     id UUID PRIMARY KEY,
@@ -73,7 +88,7 @@ async def upsert_user(pool: asyncpg.Pool, user_id: int):
             user_id,
         )
 
-# ======== TonAPI helpers ========
+# ======== TonAPI ========
 class TonAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -92,15 +107,10 @@ class TonAPI:
             return False
 
     async def find_incoming_with_comment(
-        self,
-        address: str,
-        comment: str,
-        min_amount_ton: float,
-        lookback_minutes: int = 90
+        self, address: str, comment: str, min_amount_ton: float, lookback_minutes: int = 90
     ) -> Optional[Tuple[str, float]]:
         if not address:
             return None
-
         url = f"{self.base}/accounts/{address}/transactions?limit=100"
         since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
         try:
@@ -143,15 +153,9 @@ class TonAPI:
 
             if msg_comment == comment_lower and amount_ton is not None and amount_ton >= min_amount_ton:
                 return tx_hash or "unknown", amount_ton
-
         return None
 
 # ======== Utils ========
-def build_ton_transfer_link(address: str, amount_ton: float, comment: str) -> str:
-    amount_nanotons = int(amount_ton * TON_DECIMALS)
-    safe_comment = comment[:120]
-    return f"ton://transfer/{address}?amount={amount_nanotons}&text={safe_comment}"
-
 def gen_comment() -> str:
     return f"pay-{uuid.uuid4().hex[:6]}"
 
@@ -164,7 +168,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/scanner_on — включить мониторинг лотов\n"
         "/scanner_off — выключить мониторинг\n"
         "/scanner_settings — настройки фильтров\n"
-        "/pay — ссылка на оплату (ton://transfer)\n"
+        "/pay — ссылка на оплату (есть web-кнопки)\n"
         "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
         "/health — проверить TonAPI и Pinata"
     )
@@ -182,7 +186,9 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
         return
 
     comment = gen_comment()
-    link = build_ton_transfer_link(TON_WALLET_ADDRESS, MIN_PAYMENT_TON, comment)
+    ton_link = build_ton_transfer_link(TON_WALLET_ADDRESS, MIN_PAYMENT_TON, comment)
+    tk_link = build_tonkeeper_link(TON_WALLET_ADDRESS, MIN_PAYMENT_TON, comment)
+    th_link = build_tonhub_link(TON_WALLET_ADDRESS, MIN_PAYMENT_TON, comment)
 
     async with pool.acquire() as con:
         await con.execute(
@@ -196,12 +202,13 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
     msg = (
         "Оплата доступа/покупки.\n\n"
         f"Сумма: {MIN_PAYMENT_TON:.3f} TON или больше\n"
-        f"Комментарий: `{comment}`\n\n"
-        "Нажми кнопку ниже или оплати вручную по адресу. "
-        "Важно: не меняй комментарий — по нему мы подтвердим платёж.\n"
+        f"Комментарий: `{comment}`\n"
+        f"Адрес: `{TON_WALLET_ADDRESS}`\n\n"
+        "Если ссылка ниже не открывается на ПК — используй кнопки Tonkeeper/Tonhub (web) "
+        "или оплати вручную из @wallet: вставь адрес и комментарий как указано выше.\n\n"
         f"После оплаты запусти: `/verify {comment}`"
     )
-    await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(link))
+    await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(ton_link, tk_link, th_link))
 
 async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     parts = m.text.split(maxsplit=1)
@@ -228,10 +235,7 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         return
 
     found = await tonapi.find_incoming_with_comment(
-        address=TON_WALLET_ADDRESS,
-        comment=comment,
-        min_amount_ton=MIN_PAYMENT_TON,
-        lookback_minutes=180
+        address=TON_WALLET_ADDRESS, comment=comment, min_amount_ton=MIN_PAYMENT_TON, lookback_minutes=180
     )
     if not found:
         await m.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
@@ -240,20 +244,12 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     tx_hash, amount_ton = found
     async with pool.acquire() as con:
         await con.execute(
-            """
-            UPDATE app_payments
-            SET status = 'paid', tx_hash = $2, paid_at = now()
-            WHERE id = $1
-            """,
+            "UPDATE app_payments SET status='paid', tx_hash=$2, paid_at=now() WHERE id=$1",
             row["id"], tx_hash
         )
-        # Авто-включаем сканер
         await con.execute(
-            """
-            INSERT INTO app_users (user_id, scanner_enabled, updated_at)
-            VALUES ($1, TRUE, now())
-            ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()
-            """,
+            "INSERT INTO app_users (user_id, scanner_enabled, updated_at) VALUES ($1, TRUE, now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
             m.from_user.id
         )
 
@@ -271,18 +267,10 @@ async def profile_handler(m: types.Message, pool: asyncpg.Pool):
             m.from_user.id
         )
         last_tx = await con.fetchrow(
-            """
-            SELECT amount_ton, paid_at FROM app_payments
-            WHERE user_id = $1 AND status = 'paid'
-            ORDER BY paid_at DESC
-            LIMIT 1
-            """,
+            "SELECT amount_ton, paid_at FROM app_payments WHERE user_id=$1 AND status='paid' ORDER BY paid_at DESC LIMIT 1",
             m.from_user.id
         )
-        enabled = await con.fetchval(
-            "SELECT scanner_enabled FROM app_users WHERE user_id=$1",
-            m.from_user.id
-        )
+        enabled = await con.fetchval("SELECT scanner_enabled FROM app_users WHERE user_id=$1", m.from_user.id)
 
     txt = [
         f"Сканер: {'включён' if enabled else 'выключен'}",
