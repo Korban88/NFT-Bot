@@ -2,6 +2,7 @@
 import asyncio
 import os
 import uuid
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.parse import quote
@@ -97,7 +98,6 @@ async def upsert_user(pool: asyncpg.Pool, user_id: int):
         )
 
 async def get_wallet(pool: asyncpg.Pool) -> str:
-    """Адрес для приёма платежей: сначала из БД, затем из ENV."""
     async with pool.acquire() as con:
         row = await con.fetchrow("SELECT value FROM app_config WHERE key='wallet_address'")
     return row["value"] if row and row["value"] else ENV_WALLET
@@ -109,6 +109,44 @@ async def set_wallet(pool: asyncpg.Pool, address: str):
             "ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=now()",
             address.strip()
         )
+
+# ======== Address utils (локальная конвертация) ========
+def _b64url_decode_padded(s: str) -> bytes:
+    s = s.replace(' ', '').strip()
+    pad = (-len(s)) % 4
+    s += "=" * pad
+    return base64.urlsafe_b64decode(s)
+
+def friendly_to_raw(addr: str) -> Optional[str]:
+    """
+    Конвертирует friendly (UQ.../EQ...) в raw "wc:hex".
+    Формат friendly: 1 byte tag, 1 byte workchain(signed), 32 bytes hash, 2 bytes CRC16 (игнорируем).
+    """
+    try:
+        b = _b64url_decode_padded(addr)
+        if len(b) < 34:  # ожидаем минимум tag(1)+wc(1)+hash(32)
+            return None
+        tag = b[0]  # не используем
+        wc = int.from_bytes(b[1:2], "big", signed=True)
+        hash_part = b[2:34]
+        return f"{wc}:{hash_part.hex()}"
+    except Exception:
+        return None
+
+def normalize_for_tonapi(addr: str) -> List[str]:
+    """
+    Возвращает варианты идентификаторов аккаунта для TonAPI:
+    - исходный (как есть)
+    - raw (если смогли распарсить friendly)
+    """
+    variants = []
+    a = addr.strip()
+    if a:
+        variants.append(a)
+        raw = friendly_to_raw(a)
+        if raw and raw not in variants:
+            variants.append(raw)
+    return variants
 
 # ======== TonAPI ========
 class TonAPI:
@@ -128,22 +166,6 @@ class TonAPI:
         except Exception:
             return False
 
-    async def _convert_address(self, address: str) -> Dict[str, str]:
-        url = f"{self.base}/tools/convert_address?address={address}"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(url, headers=self._headers())
-            r.raise_for_status()
-            data = r.json()
-            return {
-                "orig": address,
-                "bounceable": (data.get("bounceable") or {}).get("b64url") or "",
-                "non_bounceable": (data.get("non_bounceable") or {}).get("b64url") or "",
-                "raw": data.get("raw") or "",
-            }
-        except Exception:
-            return {"orig": address, "bounceable": "", "non_bounceable": "", "raw": ""}
-
     async def _fetch_tx(self, account_id: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
         url = f"{self.base}/accounts/{account_id}/transactions?limit={limit}"
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -154,18 +176,11 @@ class TonAPI:
         return r.status_code, None
 
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        # как есть
-        _, items = await self._fetch_tx(address, limit)
-        if items is not None:
-            return items
-        # нормализуем и ретраим
-        forms = await self._convert_address(address)
-        for key in ["bounceable", "non_bounceable", "raw"]:
-            acc = forms.get(key)
-            if acc:
-                code, items = await self._fetch_tx(acc, limit)
-                if items is not None:
-                    return items
+        # Пробуем исходный и локально сконвертированный raw
+        for acc in normalize_for_tonapi(address):
+            code, items = await self._fetch_tx(acc, limit)
+            if items is not None:
+                return items
         return []
 
     @staticmethod
@@ -249,9 +264,9 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/pay — ссылка на оплату (есть web‑кнопки)\n"
         "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
         "/debug_tx — последние транзакции (отладка)\n"
-        "/debug_addr — формы адреса и доступность TonAPI\n"
-        "/set_wallet АДРЕС — сменить адрес приёма (только для тебя)\n"
-        "/health — проверить TonAPI и Pinata\n\n"
+        "/debug_addr — проверить формы адреса\n"
+        "/set_wallet АДРЕС — сменить адрес приёма\n"
+        "/health — проверить TonAPI\n\n"
         f"Текущий адрес приёма: {wa[:6]}…{wa[-6:] if wa else '—'}"
     )
     await m.answer(text, reply_markup=main_kb())
@@ -259,12 +274,11 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
 async def health_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     ok = await tonapi.health()
     wa = await get_wallet(pool)
-    txt = (
+    await m.answer(
         "Health:\n"
         f"TonAPI: {'ok' if ok else 'fail'}\n"
         f"Wallet: {wa[:6]}…{wa[-6:] if wa else '—'}"
     )
-    await m.answer(txt)
 
 async def pay_handler(m: types.Message, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
@@ -388,24 +402,13 @@ async def debug_addr_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Poo
     if not wallet:
         await m.answer("Адрес приёма не задан. Укажи его: /set_wallet <адрес TON>")
         return
-    forms = await tonapi._convert_address(wallet)
-    parts = [f"Исходный: {forms.get('orig') or '—'}",
-             f"Bounceable: {forms.get('bounceable') or '—'}",
-             f"Non-bounceable: {forms.get('non_bounceable') or '—'}",
-             f"Raw: {forms.get('raw') or '—'}"]
 
-    # Проверим, какие формы TonAPI принимает
-    ok = []
-    for key in ["orig", "bounceable", "non_bounceable", "raw"]:
-        acc = forms.get(key)
-        if not acc:
-            continue
-        code, items = await tonapi._fetch_tx(acc, limit=1)
-        ok.append(f"{key}: HTTP {code}, items={'yes' if items else 'no'}")
-    parts.append("\nПроверка эндпоинта:")
-    parts.extend(ok or ["нет попыток"])
-
-    await m.answer("\n".join(parts))
+    variants = normalize_for_tonapi(wallet)
+    lines = [f"Исходный: {wallet}", "Варианты для TonAPI:"]
+    for v in variants:
+        code, items = await tonapi._fetch_tx(v, limit=1)
+        lines.append(f"— {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+    await m.answer("\n".join(lines))
 
 async def set_wallet_handler(m: types.Message, pool: asyncpg.Pool):
     parts = m.text.split(maxsplit=1)
@@ -457,7 +460,7 @@ async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
             "UPDATE app_users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
             m.from_user.id
         )
-    await m.answer("Мониторинг выключен.", reply_markup=main_kб())
+    await m.answer("Мониторинг выключен.", reply_markup=main_kb())
 
 async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer(
