@@ -1,69 +1,81 @@
-# handlers.py — минимально-рабочие хендлеры для aiogram v2
-# Без внешних зависимостей: всё, что нужно, создаём здесь.
-
+import logging
 from aiogram import types, Dispatcher
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from config import settings
+from services.tonapi import TonAPI
+from services.ipfs import PinataIPFS
 
-# ==== Локальные клавиатуры (без отдельного файла) ====
+logger = logging.getLogger("nftbot")
 
-def main_kb() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("Купить NFT"), KeyboardButton("О коллекции"))
-    kb.add(KeyboardButton("Мой профиль"))
-    return kb
-
-# ==== Хендлеры ====
+# ——— Команды ———
 
 async def cmd_start(message: types.Message):
     text = (
-        "Привет! Это твой NFT-бот 👋\n\n"
-        "Я пока в базовой конфигурации: показываю меню и отвечаю на основные кнопки.\n"
-        "Нажми «Купить NFT», «О коллекции» или «Мой профиль»."
-    )
-    await message.answer(text, reply_markup=main_kb())
-
-async def about_collection(message: types.Message):
-    text = (
-        "О коллекции:\n"
-        "— Это демо-экран. На следующем шаге сюда подставим реальные данные коллекции и цены.\n"
-        "— Добавим карточки NFT, превью и ссылки.\n"
+        "NFT Бот запущен.\n\n"
+        "Доступные команды:\n"
+        "/scanner_on — включить мониторинг лотов\n"
+        "/scanner_off — выключить мониторинг\n"
+        "/scanner_settings — настройки фильтров\n"
+        "/pay — ссылка на оплату (ton://transfer)\n"
+        "/health — проверить TonAPI и Pinata\n"
     )
     await message.answer(text)
 
-async def my_profile(message: types.Message):
-    text = (
-        "Мой профиль:\n"
-        "— Здесь будет история твоих заявок/покупок.\n"
-        "— После подключения базы появится список заказов и статусы."
+async def cmd_pay(message: types.Message):
+    api = TonAPI()
+    unique = api.unique_comment("pay")
+    # На старте для теста ставим 0.1 TON. Потом заменим на динамическую сумму.
+    link = api.build_ton_transfer_url(settings.TON_WALLET_ADDRESS, amount_ton=0.1, comment=unique)
+    await api.close()
+    await message.answer(
+        "Оплата (тест 0.1 TON):\n"
+        f"{link}\n\n"
+        f"Комментарий-пометка: {unique}\n"
+        "После оплаты мы сможем верифицировать транзакцию по комментарию."
     )
-    await message.answer(text)
 
-async def buy_nft(message: types.Message):
-    text = (
-        "Покупка NFT:\n"
-        "— В Iteration 1 здесь появится реальная ссылка на оплату в TON (ton://transfer...).\n"
-        "— После оплаты бот проверит транзакцию и вернёт ссылку на NFT/metadata.\n"
-        "Сейчас это заглушка — проверяем, что бот отвечает на команды и кнопки."
+async def cmd_health(message: types.Message):
+    # Проверяем доступ к TonAPI и Pinata
+    ton_ok = "fail"
+    pin_ok = "fail"
+
+    try:
+        ton = TonAPI()
+        info = await ton.get_account_info(settings.TON_WALLET_ADDRESS)
+        ton_ok = "ok" if info.get("address") else "warn"
+        await ton.close()
+    except Exception as e:
+        logger.exception("TonAPI health error: %s", e)
+
+    try:
+        ipfs = PinataIPFS()
+        cid = await ipfs.pin_json({"nftbot": "healthcheck"})
+        url = ipfs.gateway_url(cid)
+        pin_ok = "ok" if cid else "warn"
+        await ipfs.close()
+    except Exception as e:
+        logger.exception("Pinata health error: %s", e)
+
+    await message.answer(f"Health:\nTonAPI: {ton_ok}\nPinata: {pin_ok}")
+
+async def cmd_scanner_on(message: types.Message):
+    # Пока заглушка. На шаге 2 добавим планировщик и фильтры.
+    await message.answer("Сканер включен (заглушка). В следующем шаге добавим реальные фильтры и уведомления.")
+
+async def cmd_scanner_off(message: types.Message):
+    await message.answer("Сканер выключен (заглушка).")
+
+async def cmd_scanner_settings(message: types.Message):
+    await message.answer(
+        "Настройки сканера (заглушка):\n"
+        "— скидка: ≥ 20–30%\n"
+        "— фильтры: коллекции, цена, время, редкость\n"
+        "В следующем шаге добавим сохранение в БД и изменение через кнопки."
     )
-    await message.answer(text)
-
-# ==== Регистрация хендлеров ====
 
 def register_handlers(dp: Dispatcher):
-    # Команда /start
     dp.register_message_handler(cmd_start, commands=["start"])
-
-    # Текстовые кнопки (без нестандартных фильтров)
-    dp.register_message_handler(
-        buy_nft,
-        lambda m: m.text and m.text.strip().lower().startswith("купить nft")
-    )
-    dp.register_message_handler(
-        about_collection,
-        lambda m: m.text and m.text.strip().lower().startswith("о коллекции")
-    )
-    dp.register_message_handler(
-        my_profile,
-        lambda m: m.text and m.text.strip().lower().startswith("мой профиль")
-    )
-# handlers.py - обработчики команд и платежей
+    dp.register_message_handler(cmd_pay, commands=["pay"])
+    dp.register_message_handler(cmd_health, commands=["health"])
+    dp.register_message_handler(cmd_scanner_on, commands=["scanner_on"])
+    dp.register_message_handler(cmd_scanner_off, commands=["scanner_off"])
+    dp.register_message_handler(cmd_scanner_settings, commands=["scanner_settings"])
