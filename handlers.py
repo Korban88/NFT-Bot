@@ -158,6 +158,7 @@ def gen_comment() -> str:
 # ======== Handlers ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await upsert_user(pool, m.from_user.id)
+    # Без угловых скобок, чтобы не ломать HTML parse mode
     text = (
         "Добро пожаловать в NFT бот.\n\n"
         "Доступные команды:\n"
@@ -165,7 +166,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/scanner_off — выключить мониторинг\n"
         "/scanner_settings — настройки фильтров\n"
         "/pay — ссылка на оплату (ton://transfer)\n"
-        "/verify <комментарий> — проверить оплату по комментарию\n"
+        "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
         "/health — проверить TonAPI и Pinata"
     )
     await m.answer(text, reply_markup=main_kb())
@@ -247,7 +248,7 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
             """,
             row["id"], tx_hash
         )
-        # Авто-включаем сканер для пользователя после успешной оплаты
+        # Авто-включаем сканер
         await con.execute(
             """
             INSERT INTO app_users (user_id, scanner_enabled, updated_at)
