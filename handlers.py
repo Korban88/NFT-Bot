@@ -26,7 +26,7 @@ async def cmd_start(message: types.Message):
         "/scanner_off — выключить мониторинг\n"
         "/scanner_settings — настройки фильтров\n"
         "/pay — ссылка на оплату (ton://transfer)\n"
-        "/verify <комментарий> — проверить оплату по комментарию\n"
+        "/verify &lt;комментарий&gt; — проверить оплату по комментарию\n"
         "/health — проверить TonAPI и Pinata\n"
     )
     await message.answer(text, reply_markup=build_main_kb())
@@ -42,7 +42,7 @@ async def cmd_pay(message: types.Message):
         await message.answer(
             "Оплата (тест 0.1 TON):\n"
             f"{link}\n\n"
-            f"Комментарий-пометка: <code>{unique}</code>\n"
+            f"Комментарий‑пометка: <code>{unique}</code>\n"
             "После оплаты пришли команду:\n"
             f"<code>/verify {unique}</code>"
         )
@@ -56,15 +56,10 @@ async def cmd_verify(message: types.Message):
     Ищем входящую транзакцию с этим комментарием и суммой >= 0.1 TON.
     При успехе — пишем метаданные в IPFS (если настроен PINATA_JWT).
     """
-    parts = (message.get_args() or "").strip()
-    if not parts:
-        await message.answer("Укажи комментарий: например\n<code>/verify pay-xxxxxx</code>")
+    comment = (message.get_args() or "").strip()
+    if not comment:
+        await message.answer("Укажи комментарий, например: <code>/verify pay-xxxxxx</code>")
         return
-
-    comment = parts
-    ton_ok = False
-    tx_hash = None
-    amount_ton = 0.0
 
     try:
         ton = TonAPI()
@@ -72,28 +67,25 @@ async def cmd_verify(message: types.Message):
             settings.TON_WALLET_ADDRESS, comment_text=comment, min_amount_ton=0.1, limit=50
         )
         await ton.close()
-
-        if not found:
-            await message.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
-            return
-
-        tx, value_nano = found
-        ton_ok = True
-        tx_hash = tx.get("hash") or tx.get("transaction_id") or "unknown"
-        amount_ton = value_nano / 1_000_000_000.0
-
     except Exception as e:
         logger.exception("verify TonAPI error: %s", e)
         await message.answer("Ошибка при обращении к TonAPI. Попробуй позже.")
         return
 
-    # Если нашли платеж — пробуем создать метаданные NFT в IPFS
+    if not found:
+        await message.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
+        return
+
+    tx, value_nano = found
+    tx_hash = tx.get("hash") or tx.get("transaction_id") or "unknown"
+    amount_ton = value_nano / 1_000_000_000.0
+
+    # Пишем метаданные в IPFS (если PINATA_JWT задан)
     try:
-        ipfs = PinataIPFS()  # упадёт, если PINATA_JWT не задан
+        ipfs = PinataIPFS()
         name = "Field & Light — Early Access"
         description = "Покупка зафиксирована в блокчейне TON. Метаданные хранятся в IPFS."
-        # Пока картинку-заглушку не грузим — подставим ссылку-плейсхолдер (можно заменить позже на IPFS CID картинки)
-        image_url = "https://gateway.pinata.cloud/ipfs/QmPlaceholderImage"  # заменим на реальный CID позже
+        image_url = "https://gateway.pinata.cloud/ipfs/QmPlaceholderImage"  # заменим позже на реальный CID картинки
         attributes = {
             "collection": "FLIGHT",
             "buyer_telegram_id": message.from_user.id,
@@ -113,18 +105,11 @@ async def cmd_verify(message: types.Message):
             f"URL: {url}"
         )
     except Exception as e:
-        # Если Pinata не настроен — всё равно подтверждаем платеж, но сообщаем, что мету не записали
         logger.exception("Pinata error: %s", e)
-        if ton_ok:
-            await message.answer(
-                "Оплата подтверждена ✅\n"
-                f"Сумма: <b>{amount_ton:.3f} TON</b>\n"
-                f"TX: <code>{tx_hash}</code>\n\n"
-                "Но IPFS (Pinata) не настроен, метаданные не записаны. "
-                "Добавь PINATA_JWT в Railway → Variables и повтори /verify."
-            )
-        else:
-            await message.answer("Не удалось подтвердить оплату.")
+        await message.answer(
+            "Оплата подтверждена ✅, но IPFS (Pinata) не настроен — метаданные не записаны.\n"
+            "Добавь PINATA_JWT в Railway → Variables и повтори /verify."
+        )
 
 async def cmd_health(message: types.Message):
     ton_ok = "fail"
@@ -163,11 +148,13 @@ async def cmd_scanner_settings(message: types.Message):
         "В следующем шаге добавим сохранение в БД и изменение через кнопки."
     )
 
-# ---------- Обработчики кнопок (reply-клавиатура) ----------
+# ---------- Обработчики кнопок ----------
 async def on_buy_nft(message: types.Message):
     await message.answer(
-        "Шаг покупки:\n1) Нажми /pay — получишь ссылку на перевод и уникальный комментарий.\n"
-        "2) Соверши перевод.\n3) Пришли команду /verify <комментарий>.\n"
+        "Шаг покупки:\n"
+        "1) Нажми /pay — получишь ссылку на перевод и уникальный комментарий.\n"
+        "2) Соверши перевод.\n"
+        "3) Пришли команду: <code>/verify твой_комментарий</code>.\n"
         "При успехе метаданные будут сохранены в IPFS."
     )
 
