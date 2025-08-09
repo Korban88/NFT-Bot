@@ -33,8 +33,9 @@ def pay_kb(link: str) -> InlineKeyboardMarkup:
     return kb
 
 # ======== DB helpers ========
-CREATE_PAYMENTS_SQL = """
-CREATE TABLE IF NOT EXISTS payments (
+# Свои таблицы, чтобы не конфликтовать с чужими
+CREATE_APP_PAYMENTS_SQL = """
+CREATE TABLE IF NOT EXISTS app_payments (
     id UUID PRIMARY KEY,
     user_id BIGINT NOT NULL,
     comment TEXT NOT NULL,
@@ -44,11 +45,10 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     paid_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS payments_user_id_idx ON payments(user_id);
-CREATE INDEX IF NOT EXISTS payments_comment_idx ON payments(comment);
+CREATE INDEX IF NOT EXISTS app_payments_user_id_idx ON app_payments(user_id);
+CREATE INDEX IF NOT EXISTS app_payments_comment_idx ON app_payments(comment);
 """
 
-# Отдельная таблица, чтобы не конфликтовать с чужой `users`
 CREATE_APP_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS app_users (
     user_id BIGINT PRIMARY KEY,
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS app_users (
 async def ensure_tables(pool: asyncpg.Pool):
     async with pool.acquire() as con:
         async with con.transaction():
-            await con.execute(CREATE_PAYMENTS_SQL)
+            await con.execute(CREATE_APP_PAYMENTS_SQL)
             await con.execute(CREATE_APP_USERS_SQL)
 
 async def upsert_user(pool: asyncpg.Pool, user_id: int):
@@ -158,7 +158,6 @@ def gen_comment() -> str:
 # ======== Handlers ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await upsert_user(pool, m.from_user.id)
-    # Без угловых скобок, чтобы не ломать HTML parse mode
     text = (
         "Добро пожаловать в NFT бот.\n\n"
         "Доступные команды:\n"
@@ -188,7 +187,7 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         await con.execute(
             """
-            INSERT INTO payments (id, user_id, comment, amount_ton, status)
+            INSERT INTO app_payments (id, user_id, comment, amount_ton, status)
             VALUES ($1, $2, $3, $4, 'pending')
             """,
             uuid.uuid4(), m.from_user.id, comment, MIN_PAYMENT_TON
@@ -214,7 +213,7 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         row = await con.fetchrow(
             """
-            SELECT id, status FROM payments
+            SELECT id, status FROM app_payments
             WHERE user_id = $1 AND comment = $2
             ORDER BY created_at DESC
             LIMIT 1
@@ -242,7 +241,7 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         await con.execute(
             """
-            UPDATE payments
+            UPDATE app_payments
             SET status = 'paid', tx_hash = $2, paid_at = now()
             WHERE id = $1
             """,
@@ -268,12 +267,12 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         total_paid = await con.fetchval(
-            "SELECT COALESCE(SUM(amount_ton),0) FROM payments WHERE user_id=$1 AND status='paid'",
+            "SELECT COALESCE(SUM(amount_ton),0) FROM app_payments WHERE user_id=$1 AND status='paid'",
             m.from_user.id
         )
         last_tx = await con.fetchrow(
             """
-            SELECT amount_ton, paid_at FROM payments
+            SELECT amount_ton, paid_at FROM app_payments
             WHERE user_id = $1 AND status = 'paid'
             ORDER BY paid_at DESC
             LIMIT 1
