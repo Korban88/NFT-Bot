@@ -49,8 +49,9 @@ CREATE INDEX IF NOT EXISTS payments_user_id_idx ON payments(user_id);
 CREATE INDEX IF NOT EXISTS payments_comment_idx ON payments(comment);
 """
 
-CREATE_USERS_SQL = """
-CREATE TABLE IF NOT EXISTS users (
+# НОВАЯ таблица под наших пользователей, чтобы не конфликтовать с уже существующей `users`
+CREATE_APP_USERS_SQL = """
+CREATE TABLE IF NOT EXISTS app_users (
     user_id BIGINT PRIMARY KEY,
     scanner_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -61,13 +62,13 @@ async def ensure_tables(pool: asyncpg.Pool):
     async with pool.acquire() as con:
         async with con.transaction():
             await con.execute(CREATE_PAYMENTS_SQL)
-            await con.execute(CREATE_USERS_SQL)
+            await con.execute(CREATE_APP_USERS_SQL)
 
 async def upsert_user(pool: asyncpg.Pool, user_id: int):
     async with pool.acquire() as con:
         await con.execute(
             """
-            INSERT INTO users (user_id) VALUES ($1)
+            INSERT INTO app_users (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO UPDATE SET updated_at = now()
             """,
             user_id,
@@ -98,14 +99,9 @@ class TonAPI:
         min_amount_ton: float,
         lookback_minutes: int = 90
     ) -> Optional[Tuple[str, float]]:
-        """
-        Возвращает (tx_hash, amount_ton) если найдена входящая транзакция
-        на address с заданным комментарием и суммой >= min_amount_ton.
-        """
         if not address:
             return None
 
-        # Берем последние 100 транзакций за lookback интервал
         url = f"{self.base}/accounts/{address}/transactions?limit=100"
         since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
         try:
@@ -121,22 +117,16 @@ class TonAPI:
         comment_lower = comment.strip().lower()
 
         for tx in items:
-            # В разных версиях TonAPI поле может называться по-разному
-            utime = tx.get("utime") or tx.get("timestamp")  # epoch seconds
+            utime = tx.get("utime") or tx.get("timestamp")
             if utime:
                 tx_dt = datetime.fromtimestamp(int(utime), tz=timezone.utc)
                 if tx_dt < since_dt:
                     continue
 
-            # hash
             tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt")
-
-            # входящее сообщение и комментарий
             in_msg = tx.get("in_msg") or tx.get("in_msg_decoded") or {}
             msg_comment = (in_msg.get("message") or in_msg.get("decoded_body", {}).get("text") or "").strip().lower()
 
-            # сумма
-            # Иногда сумма лежит в in_msg["value"] (в нанотонах)
             raw_value = in_msg.get("value")
             amount_ton = None
             if raw_value is not None:
@@ -144,7 +134,6 @@ class TonAPI:
                     amount_ton = float(raw_value) / TON_DECIMALS
                 except Exception:
                     amount_ton = None
-            # fallback из "in_msg.decoded_body.amount"
             if amount_ton is None:
                 body_amt = in_msg.get("decoded_body", {}).get("amount")
                 if body_amt is not None:
@@ -153,7 +142,6 @@ class TonAPI:
                     except Exception:
                         amount_ton = None
 
-            # фильтруем
             if msg_comment == comment_lower and amount_ton is not None and amount_ton >= min_amount_ton:
                 return tx_hash or "unknown", amount_ton
 
@@ -161,16 +149,11 @@ class TonAPI:
 
 # ======== Utils ========
 def build_ton_transfer_link(address: str, amount_ton: float, comment: str) -> str:
-    """
-    ton://transfer/<address>?amount=<nanotons>&text=<comment>
-    """
     amount_nanotons = int(amount_ton * TON_DECIMALS)
-    # Комментарий безопаснее слегка урезать
     safe_comment = comment[:120]
     return f"ton://transfer/{address}?amount={amount_nanotons}&text={safe_comment}"
 
 def gen_comment() -> str:
-    # Например: pay-8c1d3a
     return f"pay-{uuid.uuid4().hex[:6]}"
 
 # ======== Handlers ========
@@ -190,7 +173,6 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
 
 async def health_handler(m: types.Message, tonapi: TonAPI):
     ok = await tonapi.health()
-    # Pinata проверяем простым фактом наличия ключа: реальный пинг можно добавить позже
     pinata_ok = bool(os.getenv("PINATA_JWT") or os.getenv("PINATA_API_KEY"))
     txt = "Health:\nTonAPI: {}\nPinata: {}".format("ok" if ok else "fail", "ok" if pinata_ok else "fail")
     await m.answer(txt)
@@ -218,19 +200,17 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
         f"Комментарий: `{comment}`\n\n"
         "Нажми кнопку ниже или оплати вручную по адресу. "
         "Важно: не меняй комментарий — по нему мы подтвердим платёж.\n"
-        "После оплаты запусти: `/verify {comment}`"
+        f"После оплаты запусти: `/verify {comment}`"
     )
     await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(link))
 
 async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
-    # Ожидаем: /verify pay-xxxxxx
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Укажи комментарий, например: `/verify pay-xxxxxx`", parse_mode="Markdown")
         return
 
     comment = parts[1].strip()
-    # Проверим, есть ли такой pending в БД у пользователя
     async with pool.acquire() as con:
         row = await con.fetchrow(
             """
@@ -248,7 +228,6 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         await m.answer("Этот платёж уже подтверждён. Можешь пользоваться функционалом бота.")
         return
 
-    # Ищем транзакцию в TonAPI
     found = await tonapi.find_incoming_with_comment(
         address=TON_WALLET_ADDRESS,
         comment=comment,
@@ -260,7 +239,6 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         return
 
     tx_hash, amount_ton = found
-    # Обновим запись
     async with pool.acquire() as con:
         await con.execute(
             """
@@ -279,7 +257,6 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
     )
 
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
-    # Мини-профиль: число покупок и последняя активность
     async with pool.acquire() as con:
         total_paid = await con.fetchval(
             "SELECT COALESCE(SUM(amount_ton),0) FROM payments WHERE user_id=$1 AND status='paid'",
@@ -308,7 +285,7 @@ async def profile_handler(m: types.Message, pool: asyncpg.Pool):
 async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO users (user_id, scanner_enabled) VALUES ($1, TRUE) "
+            "INSERT INTO app_users (user_id, scanner_enabled) VALUES ($1, TRUE) "
             "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
             m.from_user.id
         )
@@ -317,13 +294,12 @@ async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
 async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         await con.execute(
-            "UPDATE users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
+            "UPDATE app_users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
             m.from_user.id
         )
     await m.answer("Мониторинг выключен.", reply_markup=main_kb())
 
 async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
-    # Заглушка: позже свяжем с реальными фильтрами в БД
     await m.answer(
         "Настройки сканера (временно заглушка):\n"
         "— Скидка: ≥ 20–30%\n"
@@ -335,8 +311,6 @@ async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
 # ======== Router ========
 def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     tonapi = TonAPI(TONAPI_KEY)
-
-    # Создадим таблицы при старте (безопасно)
     loop = asyncio.get_event_loop()
     loop.create_task(ensure_tables(pool))
 
@@ -350,4 +324,4 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), commands={"scanner_settings"})
     # Кнопки внизу
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
-    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: m.text == "О коллекции")
+    dp.register
