@@ -18,10 +18,10 @@ from aiogram.types import (
 # ======== Config ========
 TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON, используем Decimal
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON (Decimal)
 TON_DECIMALS = Decimal(10**9)  # nanotons per TON
 
-# ======== Keyboards/Links ========
+# ======== Keyboards / Links ========
 def main_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("Купить NFT"))
@@ -107,6 +107,52 @@ class TonAPI:
         except Exception:
             return False
 
+    # --- utils: convert & fetch ---
+    async def _convert_address(self, address: str) -> Dict[str, str]:
+        """Вернёт разные представления адреса: исходный, bounceable/non_bounceable (b64url) и raw."""
+        url = f"{self.base}/tools/convert_address?address={address}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+            return {
+                "orig": address,
+                "bounceable": (data.get("bounceable") or {}).get("b64url") or "",
+                "non_bounceable": (data.get("non_bounceable") or {}).get("b64url") or "",
+                "raw": data.get("raw") or "",
+            }
+        except Exception:
+            return {"orig": address, "bounceable": "", "non_bounceable": "", "raw": ""}
+
+    async def _fetch_tx(self, account_id: str, limit: int) -> Optional[List[Dict[str, Any]]]:
+        url = f"{self.base}/accounts/{account_id}/transactions?limit={limit}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=self._headers())
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("transactions", []) or data.get("items", []) or []
+        return None
+
+    async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
+        # 1) как есть
+        items = await self._fetch_tx(address, limit)
+        if items is not None:
+            return items
+        # 2) нормализуем и ретраим
+        forms = await self._convert_address(address)
+        tried = set()
+        for key in ["bounceable", "non_bounceable", "raw"]:
+            acc = forms.get(key)
+            if acc and acc not in tried:
+                tried.add(acc)
+                items = await self._fetch_tx(acc, limit)
+                if items is not None:
+                    return items
+        # 3) нет данных
+        return []
+
+    # --- parsing helpers ---
     @staticmethod
     def _to_ton(nanotons: Any) -> Optional[Decimal]:
         try:
@@ -116,41 +162,29 @@ class TonAPI:
 
     @staticmethod
     def _extract_comment(msg: Dict[str, Any]) -> str:
-        # возможные поля с комментарием
-        return (
-            str(
-                msg.get("message")
-                or msg.get("comment")
-                or msg.get("decoded_body", {}).get("text")
-                or msg.get("decoded", {}).get("body", {}).get("text")
-                or ""
-            ).strip()
-        )
+        return str(
+            msg.get("message")
+            or msg.get("comment")
+            or msg.get("decoded_body", {}).get("text")
+            or msg.get("decoded", {}).get("body", {}).get("text")
+            or ""
+        ).strip()
 
     @staticmethod
     def _extract_amount_ton(msg: Dict[str, Any]) -> Optional[Decimal]:
-        candidates = [
+        for candidate in [
             msg.get("value"),
             msg.get("amount"),
             msg.get("decoded_body", {}).get("amount"),
             msg.get("decoded", {}).get("body", {}).get("amount"),
-        ]
-        for c in candidates:
-            ton = TonAPI._to_ton(c)
+        ]:
+            ton = TonAPI._to_ton(candidate)
             if ton is not None:
                 return ton
         return None
 
-    async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        url = f"{self.base}/accounts/{address}/transactions?limit={limit}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers=self._headers())
-            r.raise_for_status()
-            data = r.json()
-        return data.get("transactions", []) or data.get("items", []) or []
-
     async def find_incoming_with_comment(
-        self, address: str, comment: str, min_amount_ton: Decimal, lookback_minutes: int = 180
+        self, address: str, comment: str, min_amount_ton: Decimal, lookback_minutes: int = 360
     ) -> Optional[Tuple[str, Decimal]]:
         if not address:
             return None
@@ -172,7 +206,7 @@ class TonAPI:
 
             tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or "unknown"
 
-            # собираем все возможные сообщения, где может быть комментарий/сумма
+            # возможные контейнеры с сообщениями
             msgs: List[Dict[str, Any]] = []
             if isinstance(tx.get("in_msg"), dict):
                 msgs.append(tx["in_msg"])
@@ -202,9 +236,9 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/scanner_on — включить мониторинг лотов\n"
         "/scanner_off — выключить мониторинг\n"
         "/scanner_settings — настройки фильтров\n"
-        "/pay — ссылка на оплату (есть web-кнопки)\n"
+        "/pay — ссылка на оплату (есть web‑кнопки)\n"
         "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
-        "/debug_tx — показать последние транзакции (временная отладка)\n"
+        "/debug_tx — показать последние транзакции (отладка)\n"
         "/health — проверить TonAPI и Pinata"
     )
     await m.answer(text, reply_markup=main_kb())
@@ -212,7 +246,12 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
 async def health_handler(m: types.Message, tonapi: TonAPI):
     ok = await tonapi.health()
     pinata_ok = bool(os.getenv("PINATA_JWT") or os.getenv("PINATA_API_KEY"))
-    txt = "Health:\nTonAPI: {}\nPinata: {}".format("ok" if ok else "fail", "ok" if pinata_ok else "fail")
+    txt = (
+        "Health:\n"
+        f"TonAPI: {'ok' if ok else 'fail'}\n"
+        f"Pinata: {'ok' if pinata_ok else 'fail'}\n"
+        f"Wallet: {TON_WALLET_ADDRESS[:6]}…{TON_WALLET_ADDRESS[-6:]}"
+    )
     await m.answer(txt)
 
 async def pay_handler(m: types.Message, pool: asyncpg.Pool):
@@ -300,6 +339,10 @@ async def debug_tx_handler(m: types.Message, tonapi: TonAPI):
         items = await tonapi.list_recent(TON_WALLET_ADDRESS, limit=10)
     except Exception as e:
         await m.answer(f"TonAPI error: {e}")
+        return
+
+    if not items:
+        await m.answer("Нет данных по транзакциям (TonAPI вернул пусто). Проверь адрес/задержку сети.")
         return
 
     lines = ["Последние транзакции:"]
