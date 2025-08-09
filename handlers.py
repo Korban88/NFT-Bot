@@ -12,7 +12,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.dispatcher.filters import Command
 
 # ======== Config ========
 TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "").strip()
@@ -49,7 +48,7 @@ CREATE INDEX IF NOT EXISTS payments_user_id_idx ON payments(user_id);
 CREATE INDEX IF NOT EXISTS payments_comment_idx ON payments(comment);
 """
 
-# НОВАЯ таблица под наших пользователей, чтобы не конфликтовать с уже существующей `users`
+# Отдельная таблица, чтобы не конфликтовать с чужой `users`
 CREATE_APP_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS app_users (
     user_id BIGINT PRIMARY KEY,
@@ -248,12 +247,21 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
             """,
             row["id"], tx_hash
         )
+        # Авто-включаем сканер для пользователя после успешной оплаты
+        await con.execute(
+            """
+            INSERT INTO app_users (user_id, scanner_enabled, updated_at)
+            VALUES ($1, TRUE, now())
+            ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()
+            """,
+            m.from_user.id
+        )
 
     await m.answer(
         "Оплата подтверждена.\n"
         f"Сумма: {amount_ton:.3f} TON\n"
         f"Tx: {tx_hash}\n\n"
-        "Теперь доступ к мониторингу лотов активирован. Включить: /scanner_on"
+        "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
 
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
@@ -271,10 +279,15 @@ async def profile_handler(m: types.Message, pool: asyncpg.Pool):
             """,
             m.from_user.id
         )
+        enabled = await con.fetchval(
+            "SELECT scanner_enabled FROM app_users WHERE user_id=$1",
+            m.from_user.id
+        )
+
     txt = [
-        f"Покупок: {0 if total_paid == 0 else 1 if last_tx else 0}",
-        f"Суммарно: {float(total_paid):.3f} TON",
-        "Последние сделки:"
+        f"Сканер: {'включён' if enabled else 'выключен'}",
+        f"Суммарно оплачено: {float(total_paid):.3f} TON",
+        "Последняя оплата:"
     ]
     if last_tx:
         txt.append(f"— {float(last_tx['amount_ton']):.3f} TON, {last_tx['paid_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -324,4 +337,4 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), commands={"scanner_settings"})
     # Кнопки внизу
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
-    dp.register
+    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: m.text == "О коллекции")
