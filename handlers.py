@@ -1,237 +1,353 @@
-import logging
-from aiogram import types, Dispatcher
-from aiogram.dispatcher.filters import Text
+# handlers.py
+import asyncio
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
 
-from config import settings
-from services.tonapi import TonAPI
-from services.ipfs import PinataIPFS
-from db import record_payment, user_stats, user_last_payments
+import httpx
+import asyncpg
+from aiogram import Dispatcher, types, Bot
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.dispatcher.filters import Command
 
-logger = logging.getLogger("nftbot")
+# ======== Config ========
+TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "").strip()
+TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
+MIN_PAYMENT_TON = float(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON
+TON_DECIMALS = 10**9  # nanotons per TON
 
-
-# ---------- Клавиатура ----------
-def build_main_kb() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
-    kb.row(types.KeyboardButton("Купить NFT"), types.KeyboardButton("О коллекции"))
-    kb.row(types.KeyboardButton("Мой профиль"))
+# ======== Keyboards ========
+def main_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("Купить NFT"))
+    kb.add(KeyboardButton("О коллекции"))
+    kb.add(KeyboardButton("Мой профиль"))
     return kb
 
+def pay_kb(link: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(text="Оплатить в TON", url=link))
+    return kb
 
-# ---------- Команды ----------
-async def cmd_start(message: types.Message):
+# ======== DB helpers ========
+CREATE_PAYMENTS_SQL = """
+CREATE TABLE IF NOT EXISTS payments (
+    id UUID PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    comment TEXT NOT NULL,
+    amount_ton NUMERIC(20,9) NOT NULL,
+    status TEXT NOT NULL, -- pending | paid | expired | failed
+    tx_hash TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    paid_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS payments_user_id_idx ON payments(user_id);
+CREATE INDEX IF NOT EXISTS payments_comment_idx ON payments(comment);
+"""
+
+CREATE_USERS_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id BIGINT PRIMARY KEY,
+    scanner_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+async def ensure_tables(pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        async with con.transaction():
+            await con.execute(CREATE_PAYMENTS_SQL)
+            await con.execute(CREATE_USERS_SQL)
+
+async def upsert_user(pool: asyncpg.Pool, user_id: int):
+    async with pool.acquire() as con:
+        await con.execute(
+            """
+            INSERT INTO users (user_id) VALUES ($1)
+            ON CONFLICT (user_id) DO UPDATE SET updated_at = now()
+            """,
+            user_id,
+        )
+
+# ======== TonAPI helpers ========
+class TonAPI:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base = "https://tonapi.io/v2"
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    async def health(self) -> bool:
+        url = f"{self.base}/status"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, headers=self._headers())
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def find_incoming_with_comment(
+        self,
+        address: str,
+        comment: str,
+        min_amount_ton: float,
+        lookback_minutes: int = 90
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Возвращает (tx_hash, amount_ton) если найдена входящая транзакция
+        на address с заданным комментарием и суммой >= min_amount_ton.
+        """
+        if not address:
+            return None
+
+        # Берем последние 100 транзакций за lookback интервал
+        url = f"{self.base}/accounts/{address}/transactions?limit=100"
+        since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(url, headers=self._headers())
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+        except Exception:
+            return None
+
+        items: List[Dict[str, Any]] = data.get("transactions", []) or data.get("items", []) or []
+        comment_lower = comment.strip().lower()
+
+        for tx in items:
+            # В разных версиях TonAPI поле может называться по-разному
+            utime = tx.get("utime") or tx.get("timestamp")  # epoch seconds
+            if utime:
+                tx_dt = datetime.fromtimestamp(int(utime), tz=timezone.utc)
+                if tx_dt < since_dt:
+                    continue
+
+            # hash
+            tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt")
+
+            # входящее сообщение и комментарий
+            in_msg = tx.get("in_msg") or tx.get("in_msg_decoded") or {}
+            msg_comment = (in_msg.get("message") or in_msg.get("decoded_body", {}).get("text") or "").strip().lower()
+
+            # сумма
+            # Иногда сумма лежит в in_msg["value"] (в нанотонах)
+            raw_value = in_msg.get("value")
+            amount_ton = None
+            if raw_value is not None:
+                try:
+                    amount_ton = float(raw_value) / TON_DECIMALS
+                except Exception:
+                    amount_ton = None
+            # fallback из "in_msg.decoded_body.amount"
+            if amount_ton is None:
+                body_amt = in_msg.get("decoded_body", {}).get("amount")
+                if body_amt is not None:
+                    try:
+                        amount_ton = float(body_amt) / TON_DECIMALS
+                    except Exception:
+                        amount_ton = None
+
+            # фильтруем
+            if msg_comment == comment_lower and amount_ton is not None and amount_ton >= min_amount_ton:
+                return tx_hash or "unknown", amount_ton
+
+        return None
+
+# ======== Utils ========
+def build_ton_transfer_link(address: str, amount_ton: float, comment: str) -> str:
+    """
+    ton://transfer/<address>?amount=<nanotons>&text=<comment>
+    """
+    amount_nanotons = int(amount_ton * TON_DECIMALS)
+    # Комментарий безопаснее слегка урезать
+    safe_comment = comment[:120]
+    return f"ton://transfer/{address}?amount={amount_nanotons}&text={safe_comment}"
+
+def gen_comment() -> str:
+    # Например: pay-8c1d3a
+    return f"pay-{uuid.uuid4().hex[:6]}"
+
+# ======== Handlers ========
+async def start_handler(m: types.Message, pool: asyncpg.Pool):
+    await upsert_user(pool, m.from_user.id)
     text = (
-        "NFT Бот запущен.\n\n"
+        "Добро пожаловать в NFT бот.\n\n"
         "Доступные команды:\n"
         "/scanner_on — включить мониторинг лотов\n"
         "/scanner_off — выключить мониторинг\n"
         "/scanner_settings — настройки фильтров\n"
         "/pay — ссылка на оплату (ton://transfer)\n"
-        "/verify &lt;комментарий&gt; — проверить оплату по комментарию\n"
-        "/health — проверить TonAPI и Pinata\n"
+        "/verify <комментарий> — проверить оплату по комментарию\n"
+        "/health — проверить TonAPI и Pinata"
     )
-    await message.answer(text, reply_markup=build_main_kb())
+    await m.answer(text, reply_markup=main_kb())
 
+async def health_handler(m: types.Message, tonapi: TonAPI):
+    ok = await tonapi.health()
+    # Pinata проверяем простым фактом наличия ключа: реальный пинг можно добавить позже
+    pinata_ok = bool(os.getenv("PINATA_JWT") or os.getenv("PINATA_API_KEY"))
+    txt = "Health:\nTonAPI: {}\nPinata: {}".format("ok" if ok else "fail", "ok" if pinata_ok else "fail")
+    await m.answer(txt)
 
-async def cmd_pay(message: types.Message):
-    try:
-        api = TonAPI()
-        unique = api.unique_comment("pay")
-        link = api.build_ton_transfer_url(
-            settings.TON_WALLET_ADDRESS, amount_ton=0.1, comment=unique
-        )
-        await api.close()
-        await message.answer(
-            "Оплата (тест 0.1 TON):\n"
-            f"{link}\n\n"
-            f"Комментарий‑пометка: <code>{unique}</code>\n"
-            "После оплаты пришли команду:\n"
-            f"<code>/verify {unique}</code>"
-        )
-    except Exception as e:
-        logger.exception("cmd_pay error: %s", e)
-        await message.answer("Не удалось сформировать ссылку оплаты. Попробуй позже.")
-
-
-async def cmd_verify(message: types.Message):
-    """
-    /verify <comment>
-    Ищем входящую транзакцию с этим комментарием и суммой >= 0.1 TON.
-    При успехе — пишем метаданные в IPFS (если настроен PINATA_JWT) и сохраняем запись в БД.
-    """
-    comment = (message.get_args() or "").strip()
-    if not comment:
-        await message.answer("Укажи комментарий, например: <code>/verify pay-xxxxxx</code>")
+async def pay_handler(m: types.Message, pool: asyncpg.Pool):
+    if not TON_WALLET_ADDRESS:
+        await m.answer("TON_WALLET_ADDRESS не задан. Укажи адрес в переменных окружения.")
         return
 
-    # 1) Ищем платёж в TON
-    try:
-        ton = TonAPI()
-        found = await ton.find_payment_by_comment(
-            settings.TON_WALLET_ADDRESS, comment_text=comment, min_amount_ton=0.1, limit=50
+    comment = gen_comment()
+    link = build_ton_transfer_link(TON_WALLET_ADDRESS, MIN_PAYMENT_TON, comment)
+
+    async with pool.acquire() as con:
+        await con.execute(
+            """
+            INSERT INTO payments (id, user_id, comment, amount_ton, status)
+            VALUES ($1, $2, $3, $4, 'pending')
+            """,
+            uuid.uuid4(), m.from_user.id, comment, MIN_PAYMENT_TON
         )
-        await ton.close()
-    except Exception as e:
-        logger.exception("verify TonAPI error: %s", e)
-        await message.answer("Ошибка при обращении к TonAPI. Попробуй позже.")
+
+    msg = (
+        "Оплата доступа/покупки.\n\n"
+        f"Сумма: {MIN_PAYMENT_TON:.3f} TON или больше\n"
+        f"Комментарий: `{comment}`\n\n"
+        "Нажми кнопку ниже или оплати вручную по адресу. "
+        "Важно: не меняй комментарий — по нему мы подтвердим платёж.\n"
+        "После оплаты запусти: `/verify {comment}`"
+    )
+    await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(link))
+
+async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
+    # Ожидаем: /verify pay-xxxxxx
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Укажи комментарий, например: `/verify pay-xxxxxx`", parse_mode="Markdown")
         return
 
+    comment = parts[1].strip()
+    # Проверим, есть ли такой pending в БД у пользователя
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            """
+            SELECT id, status FROM payments
+            WHERE user_id = $1 AND comment = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            m.from_user.id, comment
+        )
+    if not row:
+        await m.answer("Платёж с таким комментарием у тебя не найден. Создай новый через /pay.")
+        return
+    if row["status"] == "paid":
+        await m.answer("Этот платёж уже подтверждён. Можешь пользоваться функционалом бота.")
+        return
+
+    # Ищем транзакцию в TonAPI
+    found = await tonapi.find_incoming_with_comment(
+        address=TON_WALLET_ADDRESS,
+        comment=comment,
+        min_amount_ton=MIN_PAYMENT_TON,
+        lookback_minutes=180
+    )
     if not found:
-        await message.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
+        await m.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
         return
 
-    tx, value_nano = found
-    tx_hash = tx.get("hash") or tx.get("transaction_id") or "unknown"
-    amount_ton = value_nano / 1_000_000_000.0
-
-    # 2) Пытаемся записать метаданные в IPFS (Pinata)
-    cid = None
-    url = None
-    try:
-        ipfs = PinataIPFS()
-        name = "Field & Light — Early Access"
-        description = "Покупка зафиксирована в блокчейне TON. Метаданные хранятся в IPFS."
-        image_url = "https://gateway.pinata.cloud/ipfs/QmPlaceholderImage"  # заменим позже
-        attributes = {
-            "collection": "FLIGHT",
-            "buyer_telegram_id": message.from_user.id,
-            "tx_hash": tx_hash,
-            "amount_ton": round(amount_ton, 6),
-            "comment": comment,
-        }
-        cid, url = await ipfs.pin_nft_metadata(name, description, image_url, attributes)
-        await ipfs.close()
-    except Exception as e:
-        logger.exception("Pinata error: %s", e)
-
-    # 3) Сохраняем запись в БД (даже если Pinata не записалась)
-    try:
-        await record_payment(
-            user_id=message.from_user.id,
-            tx_hash=tx_hash,
-            comment=comment,
-            amount_nano=int(value_nano),
-            amount_ton=amount_ton,
-            cid=cid,
-            url=url,
+    tx_hash, amount_ton = found
+    # Обновим запись
+    async with pool.acquire() as con:
+        await con.execute(
+            """
+            UPDATE payments
+            SET status = 'paid', tx_hash = $2, paid_at = now()
+            WHERE id = $1
+            """,
+            row["id"], tx_hash
         )
-    except Exception as e:
-        logger.exception("DB record_payment error: %s", e)
 
-    # 4) Ответ пользователю
-    if cid and url:
-        await message.answer(
-            "Оплата подтверждена ✅\n"
-            f"Сумма: <b>{amount_ton:.3f} TON</b>\n"
-            f"TX: <code>{tx_hash}</code>\n\n"
-            "Метаданные NFT сохранены в IPFS:\n"
-            f"CID: <code>{cid}</code>\n"
-            f"URL: {url}"
+    await m.answer(
+        "Оплата подтверждена.\n"
+        f"Сумма: {amount_ton:.3f} TON\n"
+        f"Tx: {tx_hash}\n\n"
+        "Теперь доступ к мониторингу лотов активирован. Включить: /scanner_on"
+    )
+
+async def profile_handler(m: types.Message, pool: asyncpg.Pool):
+    # Мини-профиль: число покупок и последняя активность
+    async with pool.acquire() as con:
+        total_paid = await con.fetchval(
+            "SELECT COALESCE(SUM(amount_ton),0) FROM payments WHERE user_id=$1 AND status='paid'",
+            m.from_user.id
         )
+        last_tx = await con.fetchrow(
+            """
+            SELECT amount_ton, paid_at FROM payments
+            WHERE user_id = $1 AND status = 'paid'
+            ORDER BY paid_at DESC
+            LIMIT 1
+            """,
+            m.from_user.id
+        )
+    txt = [
+        f"Покупок: {0 if total_paid == 0 else 1 if last_tx else 0}",
+        f"Суммарно: {float(total_paid):.3f} TON",
+        "Последние сделки:"
+    ]
+    if last_tx:
+        txt.append(f"— {float(last_tx['amount_ton']):.3f} TON, {last_tx['paid_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
     else:
-        await message.answer(
-            "Оплата подтверждена ✅\n"
-            f"Сумма: <b>{amount_ton:.3f} TON</b>\n"
-            f"TX: <code>{tx_hash}</code>\n\n"
-            "IPFS (Pinata) не настроен или временно недоступен — метаданные не записаны.\n"
-            "Запись об оплате сохранена."
+        txt.append("— пока пусто")
+    await m.answer("\n".join(txt))
+
+async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO users (user_id, scanner_enabled) VALUES ($1, TRUE) "
+            "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
+            m.from_user.id
         )
+    await m.answer("Мониторинг включён. Уведомлю о выгодных лотах.", reply_markup=main_kb())
 
+async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
+            m.from_user.id
+        )
+    await m.answer("Мониторинг выключен.", reply_markup=main_kb())
 
-async def cmd_health(message: types.Message):
-    ton_ok = "fail"
-    pin_ok = "fail"
-
-    try:
-        ton = TonAPI()
-        info = await ton.get_account_info(settings.TON_WALLET_ADDRESS)
-        ton_ok = "ok" if info.get("address") else "warn"
-        await ton.close()
-    except Exception as e:
-        logger.exception("TonAPI health error: %s", e)
-
-    try:
-        ipfs = PinataIPFS()
-        cid = await ipfs.pin_json({"nftbot": "healthcheck"})
-        _ = ipfs.gateway_url(cid)
-        pin_ok = "ok" if cid else "warn"
-        await ipfs.close()
-    except Exception as e:
-        logger.exception("Pinata health error: %s", e)
-
-    await message.answer(f"Health:\nTonAPI: {ton_ok}\nPinata: {pin_ok}")
-
-
-async def cmd_scanner_on(message: types.Message):
-    await message.answer("Сканер включен (заглушка). В следующем шаге добавим реальные фильтры и уведомления.")
-
-
-async def cmd_scanner_off(message: types.Message):
-    await message.answer("Сканер выключен (заглушка).")
-
-
-async def cmd_scanner_settings(message: types.Message):
-    await message.answer(
-        "Настройки сканера (заглушка):\n"
-        "— скидка: ≥ 20–30%\n"
-        "— фильтры: коллекции, цена, время, редкость\n"
-        "В следующем шаге добавим сохранение в БД и изменение через кнопки."
+async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
+    # Заглушка: позже свяжем с реальными фильтрами в БД
+    await m.answer(
+        "Настройки сканера (временно заглушка):\n"
+        "— Скидка: ≥ 20–30%\n"
+        "— Коллекции: выбранные\n"
+        "— Цена/время/редкость: фильтры активны",
+        reply_markup=main_kb()
     )
 
+# ======== Router ========
+def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
+    tonapi = TonAPI(TONAPI_KEY)
 
-# ---------- Обработчики кнопок ----------
-async def on_buy_nft(message: types.Message):
-    await message.answer(
-        "Шаг покупки:\n"
-        "1) Нажми /pay — получишь ссылку на перевод и уникальный комментарий.\n"
-        "2) Соверши перевод.\n"
-        "3) Пришли команду: <code>/verify твой_комментарий</code>.\n"
-        "При успехе метаданные будут сохранены в IPFS."
-    )
+    # Создадим таблицы при старте (безопасно)
+    loop = asyncio.get_event_loop()
+    loop.create_task(ensure_tables(pool))
 
-
-async def on_about_collection(message: types.Message):
-    await message.answer("Field & Light (FLIGHT): коллекция в разработке. Добавим описание и ссылки на маркетплейсы.")
-
-
-async def on_profile(message: types.Message):
-    try:
-        stats = await user_stats(message.from_user.id)
-        rows = await user_last_payments(message.from_user.id, limit=3)
-        lines = [
-            f"Покупок: <b>{stats['count']}</b>",
-            f"Суммарно: <b>{stats['sum_ton']:.3f} TON</b>",
-            "",
-            "Последние сделки:",
-        ]
-        if not rows:
-            lines.append("— пока пусто")
-        else:
-            for r in rows:
-                part = (
-                    f"• {r['created_at'].strftime('%Y-%m-%d %H:%M')} — {r['amount_ton']:.3f} TON, "
-                    f"tx <code>{(r['tx_hash'] or '')[:12]}...</code>"
-                )
-                if r["cid"]:
-                    part += f" — <a href='{r['url']}'>IPFS</a>"
-                lines.append(part)
-        await message.answer("\n".join(lines), disable_web_page_preview=True)
-    except Exception as e:
-        logger.exception("profile error: %s", e)
-        await message.answer("Профиль временно недоступен, попробуй позже.")
-
-
-def register_handlers(dp: Dispatcher):
-    # Команды
-    dp.register_message_handler(cmd_start, commands=["start"])
-    dp.register_message_handler(cmd_pay, commands=["pay"])
-    dp.register_message_handler(cmd_verify, commands=["verify"])
-    dp.register_message_handler(cmd_health, commands=["health"])
-    dp.register_message_handler(cmd_scanner_on, commands=["scanner_on"])
-    dp.register_message_handler(cmd_scanner_off, commands=["scanner_off"])
-    dp.register_message_handler(cmd_scanner_settings, commands=["scanner_settings"])
-
-    # Кнопки (по тексту)
-    dp.register_message_handler(on_buy_nft, Text(equals="Купить NFT"))
-    dp.register_message_handler(on_about_collection, Text(equals="О коллекции"))
-    dp.register_message_handler(on_profile, Text(equals="Мой профиль"))
+    dp.register_message_handler(lambda m: start_handler(m, pool), commands={"start"})
+    dp.register_message_handler(lambda m: health_handler(m, tonapi), commands={"health"})
+    dp.register_message_handler(lambda m: pay_handler(m, pool), commands={"pay"})
+    dp.register_message_handler(lambda m: verify_handler(m, tonapi, pool), commands={"verify"})
+    dp.register_message_handler(lambda m: profile_handler(m, pool), lambda m: m.text == "Мой профиль")
+    dp.register_message_handler(lambda m: scanner_on_handler(m, pool), commands={"scanner_on"})
+    dp.register_message_handler(lambda m: scanner_off_handler(m, pool), commands={"scanner_off"})
+    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), commands={"scanner_settings"})
+    # Кнопки внизу
+    dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
+    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: m.text == "О коллекции")
