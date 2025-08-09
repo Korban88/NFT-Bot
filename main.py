@@ -1,32 +1,34 @@
-# main.py — старт NFT бота (Iteration 1) с авто-сбросом вебхука
-import logging
 import asyncio
+import logging
+import sys
+
 from aiogram import Bot, Dispatcher, executor
-from config import TELEGRAM_TOKEN
-from db import init_db
+from config import settings
 from handlers import register_handlers
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
 logger = logging.getLogger("nftbot")
 
-async def _prepare(bot: Bot):
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook removed (drop_pending_updates=True).")
-    except Exception as e:
-        logger.warning(f"Failed to delete webhook: {e}")
-
 def main():
-    init_db()
-    bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
+    if not settings.BOT_TOKEN:
+        logger.error("BOT_TOKEN is empty")
+        sys.exit(1)
+
+    bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
     dp = Dispatcher(bot)
     register_handlers(dp)
-    logger.info("Starting NFT bot (Iteration 1)...")
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_prepare(bot))
-
+    logger.info("Starting NFT bot (Iteration 1 / Step 1)...")
     executor.start_polling(dp, skip_updates=True)
 
 if __name__ == "__main__":
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            uvloop.install()
+        except Exception:
+            pass
     main()
