@@ -10,7 +10,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nftbot")
 
 async def _prepare(bot: Bot):
-    # Критично: снимаем вебхук, чтобы polling начал получать апдейты
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook removed (drop_pending_updates=True).")
@@ -24,8 +23,6 @@ def main():
     register_handlers(dp)
     logger.info("Starting NFT bot (Iteration 1)...")
 
-    # aiogram v2 executor.start_polling не принимает корутину подготовки,
-    # поэтому снимаем вебхук через loop.run_until_complete перед стартом.
     loop = asyncio.get_event_loop()
     loop.run_until_complete(_prepare(bot))
 
