@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.parse import quote
+from decimal import Decimal, InvalidOperation
 
 import httpx
 import asyncpg
@@ -17,8 +18,8 @@ from aiogram.types import (
 # ======== Config ========
 TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-MIN_PAYMENT_TON = float(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON
-TON_DECIMALS = 10**9  # nanotons per TON
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON, используем Decimal
+TON_DECIMALS = Decimal(10**9)  # nanotons per TON
 
 # ======== Keyboards/Links ========
 def main_kb() -> ReplyKeyboardMarkup:
@@ -28,16 +29,16 @@ def main_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton("Мой профиль"))
     return kb
 
-def build_ton_transfer_link(address: str, amount_ton: float, comment: str) -> str:
+def build_ton_transfer_link(address: str, amount_ton: Decimal, comment: str) -> str:
     amount_nanotons = int(amount_ton * TON_DECIMALS)
     safe_comment = comment[:120]
     return f"ton://transfer/{address}?amount={amount_nanotons}&text={safe_comment}"
 
-def build_tonkeeper_link(address: str, amount_ton: float, comment: str) -> str:
+def build_tonkeeper_link(address: str, amount_ton: Decimal, comment: str) -> str:
     amount_nanotons = int(amount_ton * TON_DECIMALS)
     return f"https://app.tonkeeper.com/transfer/{address}?amount={amount_nanotons}&text={quote(comment)}"
 
-def build_tonhub_link(address: str, amount_ton: float, comment: str) -> str:
+def build_tonhub_link(address: str, amount_ton: Decimal, comment: str) -> str:
     amount_nanotons = int(amount_ton * TON_DECIMALS)
     return f"https://tonhub.com/transfer/{address}?amount={amount_nanotons}&text={quote(comment)}"
 
@@ -106,24 +107,61 @@ class TonAPI:
         except Exception:
             return False
 
+    @staticmethod
+    def _to_ton(nanotons: Any) -> Optional[Decimal]:
+        try:
+            return Decimal(str(nanotons)) / TON_DECIMALS
+        except (InvalidOperation, TypeError):
+            return None
+
+    @staticmethod
+    def _extract_comment(msg: Dict[str, Any]) -> str:
+        # возможные поля с комментарием
+        return (
+            str(
+                msg.get("message")
+                or msg.get("comment")
+                or msg.get("decoded_body", {}).get("text")
+                or msg.get("decoded", {}).get("body", {}).get("text")
+                or ""
+            ).strip()
+        )
+
+    @staticmethod
+    def _extract_amount_ton(msg: Dict[str, Any]) -> Optional[Decimal]:
+        candidates = [
+            msg.get("value"),
+            msg.get("amount"),
+            msg.get("decoded_body", {}).get("amount"),
+            msg.get("decoded", {}).get("body", {}).get("amount"),
+        ]
+        for c in candidates:
+            ton = TonAPI._to_ton(c)
+            if ton is not None:
+                return ton
+        return None
+
+    async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
+        url = f"{self.base}/accounts/{address}/transactions?limit={limit}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+        return data.get("transactions", []) or data.get("items", []) or []
+
     async def find_incoming_with_comment(
-        self, address: str, comment: str, min_amount_ton: float, lookback_minutes: int = 90
-    ) -> Optional[Tuple[str, float]]:
+        self, address: str, comment: str, min_amount_ton: Decimal, lookback_minutes: int = 180
+    ) -> Optional[Tuple[str, Decimal]]:
         if not address:
             return None
-        url = f"{self.base}/accounts/{address}/transactions?limit=100"
+
         since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(url, headers=self._headers())
-                if r.status_code != 200:
-                    return None
-                data = r.json()
+            items = await self.list_recent(address, limit=100)
         except Exception:
             return None
 
-        items: List[Dict[str, Any]] = data.get("transactions", []) or data.get("items", []) or []
-        comment_lower = comment.strip().lower()
+        wanted = comment.strip().lower()
 
         for tx in items:
             utime = tx.get("utime") or tx.get("timestamp")
@@ -132,27 +170,23 @@ class TonAPI:
                 if tx_dt < since_dt:
                     continue
 
-            tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt")
-            in_msg = tx.get("in_msg") or tx.get("in_msg_decoded") or {}
-            msg_comment = (in_msg.get("message") or in_msg.get("decoded_body", {}).get("text") or "").strip().lower()
+            tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or "unknown"
 
-            raw_value = in_msg.get("value")
-            amount_ton = None
-            if raw_value is not None:
-                try:
-                    amount_ton = float(raw_value) / TON_DECIMALS
-                except Exception:
-                    amount_ton = None
-            if amount_ton is None:
-                body_amt = in_msg.get("decoded_body", {}).get("amount")
-                if body_amt is not None:
-                    try:
-                        amount_ton = float(body_amt) / TON_DECIMALS
-                    except Exception:
-                        amount_ton = None
+            # собираем все возможные сообщения, где может быть комментарий/сумма
+            msgs: List[Dict[str, Any]] = []
+            if isinstance(tx.get("in_msg"), dict):
+                msgs.append(tx["in_msg"])
+            if isinstance(tx.get("out_msgs"), list):
+                msgs.extend([m for m in tx["out_msgs"] if isinstance(m, dict)])
+            if isinstance(tx.get("messages"), list):
+                msgs.extend([m for m in tx["messages"] if isinstance(m, dict)])
 
-            if msg_comment == comment_lower and amount_ton is not None and amount_ton >= min_amount_ton:
-                return tx_hash or "unknown", amount_ton
+            for msg in msgs:
+                cmt = self._extract_comment(msg).lower()
+                amt = self._extract_amount_ton(msg)
+                if cmt == wanted and amt is not None and amt >= min_amount_ton:
+                    return tx_hash, amt
+
         return None
 
 # ======== Utils ========
@@ -170,6 +204,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/scanner_settings — настройки фильтров\n"
         "/pay — ссылка на оплату (есть web-кнопки)\n"
         "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
+        "/debug_tx — показать последние транзакции (временная отладка)\n"
         "/health — проверить TonAPI и Pinata"
     )
     await m.answer(text, reply_markup=main_kb())
@@ -196,12 +231,12 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
             INSERT INTO app_payments (id, user_id, comment, amount_ton, status)
             VALUES ($1, $2, $3, $4, 'pending')
             """,
-            uuid.uuid4(), m.from_user.id, comment, MIN_PAYMENT_TON
+            uuid.uuid4(), m.from_user.id, comment, float(MIN_PAYMENT_TON)
         )
 
     msg = (
         "Оплата доступа/покупки.\n\n"
-        f"Сумма: {MIN_PAYMENT_TON:.3f} TON или больше\n"
+        f"Сумма: {MIN_PAYMENT_TON} TON или больше\n"
         f"Комментарий: `{comment}`\n"
         f"Адрес: `{TON_WALLET_ADDRESS}`\n\n"
         "Если ссылка ниже не открывается на ПК — используй кнопки Tonkeeper/Tonhub (web) "
@@ -235,10 +270,10 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         return
 
     found = await tonapi.find_incoming_with_comment(
-        address=TON_WALLET_ADDRESS, comment=comment, min_amount_ton=MIN_PAYMENT_TON, lookback_minutes=180
+        address=TON_WALLET_ADDRESS, comment=comment, min_amount_ton=MIN_PAYMENT_TON, lookback_minutes=360
     )
     if not found:
-        await m.answer("Платёж не найден. Проверь комментарий и сумму (не меньше 0.1 TON).")
+        await m.answer("Платёж не найден. Проверь комментарий и сумму (не меньше минималки). Если платил только что — подожди 1–2 минуты и попробуй ещё раз.")
         return
 
     tx_hash, amount_ton = found
@@ -255,10 +290,48 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
 
     await m.answer(
         "Оплата подтверждена.\n"
-        f"Сумма: {amount_ton:.3f} TON\n"
+        f"Сумма: {amount_ton} TON\n"
         f"Tx: {tx_hash}\n\n"
         "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
+
+async def debug_tx_handler(m: types.Message, tonapi: TonAPI):
+    try:
+        items = await tonapi.list_recent(TON_WALLET_ADDRESS, limit=10)
+    except Exception as e:
+        await m.answer(f"TonAPI error: {e}")
+        return
+
+    lines = ["Последние транзакции:"]
+    shown = 0
+    for tx in items[:5]:
+        tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or "unknown"
+        utime = tx.get("utime") or tx.get("timestamp")
+        when = datetime.fromtimestamp(int(utime), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if utime else "—"
+        msgs: List[Dict[str, Any]] = []
+        if isinstance(tx.get("in_msg"), dict):
+            msgs.append(tx["in_msg"])
+        if isinstance(tx.get("out_msgs"), list):
+            msgs.extend([m for m in tx["out_msgs"] if isinstance(m, dict)])
+        if isinstance(tx.get("messages"), list):
+            msgs.extend([m for m in tx["messages"] if isinstance(m, dict)])
+
+        found_any = False
+        for msg in msgs:
+            cmt = TonAPI._extract_comment(msg)
+            amt = TonAPI._extract_amount_ton(msg)
+            if cmt or amt is not None:
+                lines.append(f"• {when} | {tx_hash}\n  comment: {cmt or '—'}\n  amount: {amt if amt is not None else '—'} TON")
+                found_any = True
+                shown += 1
+                if shown >= 5:
+                    break
+        if not found_any:
+            lines.append(f"• {when} | {tx_hash}\n  (нет комм/суммы в доступных полях)")
+        if shown >= 5:
+            break
+
+    await m.answer("\n".join(lines))
 
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
@@ -319,6 +392,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: health_handler(m, tonapi), commands={"health"})
     dp.register_message_handler(lambda m: pay_handler(m, pool), commands={"pay"})
     dp.register_message_handler(lambda m: verify_handler(m, tonapi, pool), commands={"verify"})
+    dp.register_message_handler(lambda m: debug_tx_handler(m, tonapi), commands={"debug_tx"})
     dp.register_message_handler(lambda m: profile_handler(m, pool), lambda m: m.text == "Мой профиль")
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), commands={"scanner_on"})
     dp.register_message_handler(lambda m: scanner_off_handler(m, pool), commands={"scanner_off"})
