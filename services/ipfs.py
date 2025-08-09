@@ -6,15 +6,23 @@ PINATA_BASE = "https://api.pinata.cloud"
 
 class PinataIPFS:
     def __init__(self, jwt: str = settings.PINATA_JWT, timeout: float = 25.0):
+        jwt = (jwt or "").strip()
+        # если по ошибке вставили "Bearer ey...", отрежем префикс
+        if jwt.lower().startswith("bearer "):
+            jwt = jwt.split(" ", 1)[1].strip()
         if not jwt:
             raise ValueError("PINATA_JWT is empty")
-        self._headers = {
-            "Authorization": f"Bearer {jwt}",
-        }
+
+        self._headers = {"Authorization": f"Bearer {jwt}"}
         self._client = httpx.AsyncClient(timeout=timeout, headers=self._headers, http2=True, base_url=PINATA_BASE)
 
     async def close(self):
         await self._client.aclose()
+
+    async def test_auth(self) -> bool:
+        # Удобная проверка авторизации перед пином
+        r = await self._client.get("/data/testAuthentication")
+        return r.status_code == 200
 
     async def pin_json(self, payload: Dict[str, Any]) -> str:
         r = await self._client.post("/pinning/pinJSONToIPFS", json={"pinataContent": payload})
@@ -29,21 +37,13 @@ class PinataIPFS:
         base = str(settings.PINATA_GATEWAY).rstrip("/")
         return f"{base}/{cid}"
 
-    # Удобный хелпер: создаём простые NFT-метаданные и пинним
     async def pin_nft_metadata(
-        self,
-        name: str,
-        description: str,
-        image_url: str,
-        attributes: Dict[str, Any],
+        self, name: str, description: str, image_url: str, attributes: Dict[str, Any],
     ) -> Tuple[str, str]:
-        """
-        Возвращает (cid, gateway_url)
-        """
         metadata = {
             "name": name,
             "description": description,
-            "image": image_url,  # сюда позже можно подставлять IPFS-ссылку на картинку
+            "image": image_url,
             "attributes": [{"trait_type": k, "value": v} for k, v in attributes.items()],
         }
         cid = await self.pin_json(metadata)
