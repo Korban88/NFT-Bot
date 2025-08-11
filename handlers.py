@@ -43,11 +43,11 @@ def main_kb() -> ReplyKeyboardMarkup:
     kb.add(KeyboardButton("Мой профиль"))
     return kb
 
-# ======== Утилиты времени/форматирования ========
+# ======== Утилиты ========
 def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
 
-# ======== TonAPI/TonCenter провайдеры транзакций (как у тебя было) ========
+# ======== TonAPI/TonCenter провайдеры транзакций (как было) ========
 class TonAPIProvider:
     def __init__(self, api_key: str):
         self.base = "https://tonapi.io/v2/blockchain"
@@ -98,7 +98,7 @@ class TonCenter:
             return r.status_code, data.get("result")
         return r.status_code, None
 
-# ======== Платежи (короткий генератор ссылок) ========
+# ======== Платежи (ссылки) ========
 def gen_comment() -> str:
     return "nftbot-" + uuid.uuid4().hex[:12]
 
@@ -251,6 +251,35 @@ async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
             pass
     await bot.send_message(user_id, caption, reply_markup=kb)
 
+# ======== Быстрый скан по кнопке «Обновить» ========
+async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_items: int = 3) -> int:
+    items = await fetch_listings()
+    if not items:
+        await bot.send_message(user_id, "Фид пуст или недоступен.")
+        return 0
+
+    st = await get_or_create_scanner_settings(pool, user_id)
+    sent = 0
+    for it in items:
+        it = dict(it)
+        it["discount"] = _item_discount(it)
+        it["deal_id"] = _deal_id(it)
+
+        if not _item_matches(it, st):
+            continue
+        if await was_deal_seen(pool, it["deal_id"]):
+            continue
+
+        await send_item_alert(bot, user_id, it)
+        await mark_deal_seen(pool, it)
+        sent += 1
+        if sent >= max_items:
+            break
+
+    if sent == 0:
+        await bot.send_message(user_id, "Свежих подходящих лотов нет. Попробуй позже или ослабь фильтры.")
+    return sent
+
 # ======== Сканер: загрузка фида ========
 async def fetch_listings() -> List[Dict[str, Any]]:
     """Элемент:
@@ -341,7 +370,7 @@ async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer(_settings_text(st), reply_markup=_settings_kb())
 
 async def _apply_cfg_action(user_id: int, action: str):
-    # action формата: "disc:+5" | "disc:-5" | "max:10" | "max:none" | "cols:FLIGHT" | "cols:none" | "refresh"
+    # action: "disc:+5" | "disc:-5" | "max:10" | "max:none" | "cols:FLIGHT" | "cols:none" | "refresh"
     pool = await get_pool()
     key, _, val = action.partition(":")
     if key == "disc":
@@ -369,17 +398,25 @@ async def cb_settings(call: types.CallbackQuery):
     try:
         _, action = call.data.split("cfg:", 1)
     except Exception:
-        await call.answer("Некорректная команда"); return
+        await call.answer("Некорректная команда")
+        return
 
     await _apply_cfg_action(call.from_user.id, action)
     pool = await get_pool()
     st = await get_or_create_scanner_settings(pool, call.from_user.id)
 
+    # Обновим текст настроек
     try:
         await call.message.edit_text(_settings_text(st), reply_markup=_settings_kb())
     except Exception:
-        # если не удаётся отредактировать (старое сообщение) — отправим новое
+        # если сообщение нельзя редактировать — отправим новое
         await call.message.answer(_settings_text(st), reply_markup=_settings_kb())
+
+    # Если нажали "Обновить" — сразу сделаем быстрый скан (до 3 новых лотов)
+    if action == "refresh":
+        bot = call.message.bot
+        await quick_scan_for_user(bot, call.from_user.id, pool, max_items=3)
+
     await call.answer("Готово")
 
 # ======== Команды сканера ========
@@ -399,7 +436,8 @@ async def set_discount_handler(m: types.Message, pool: asyncpg.Pool):
     try:
         val = float(parts[1].replace(",", "."))
     except Exception:
-        await m.answer("Некорректно. Пример: /set_discount 30"); return
+        await m.answer("Некорректно. Пример: /set_discount 30")
+        return
     await update_scanner_settings(pool, m.from_user.id, min_discount=val)
     await m.answer("Мин. скидка обновлена.")
 
@@ -412,7 +450,8 @@ async def set_maxprice_handler(m: types.Message, pool: asyncpg.Pool):
     try:
         val = float(parts[1].replace(",", "."))
     except Exception:
-        await m.answer("Некорректно. Пример: /set_maxprice 12.5"); return
+        await m.answer("Некорректно. Пример: /set_maxprice 12.5")
+        return
     await update_scanner_settings(pool, m.from_user.id, max_price_ton=val)
     await m.answer("Макс. цена обновлена.")
 
@@ -427,12 +466,14 @@ async def set_collections_handler(m: types.Message, pool: asyncpg.Pool):
 async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     items = await fetch_listings()
     if not items:
-        await m.answer("Фид пуст или недоступен (LISTINGS_FEED_URL)."); return
+        await m.answer("Фид пуст или недоступен (LISTINGS_FEED_URL).")
+        return
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
     sent = 0
     for it in items[:20]:
         if _item_matches(it, st):
-            await send_item_alert(bot, m.from_user.id, it); sent += 1
+            await send_item_alert(bot, m.from_user.id, it)
+            sent += 1
     if sent == 0:
         await m.answer("Подходящих лотов не найдено по текущим фильтрам.")
     else:
