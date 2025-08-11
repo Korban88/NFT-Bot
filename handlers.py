@@ -14,7 +14,7 @@ import asyncpg
 from aiogram import Dispatcher, types, Bot
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 
 # ======== Config (общие) ========
@@ -24,6 +24,7 @@ TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
 MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))
 PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))
+# Всё время — по Москве
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
 LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
 TON_DECIMALS = Decimal(10**9)
@@ -670,7 +671,6 @@ async def fetch_listings() -> List[Dict[str, Any]]:
         data = r.json()
         if isinstance(data, list):
             return data
-        # допускаем обёртку {"items":[...]}
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             return data["items"]
         return []
@@ -690,20 +690,17 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
                     uid = u["user_id"]
                     st = await get_or_create_scanner_settings(pool, uid)
                     for it in items:
-                        # нормализуем id
                         item_id = str(it.get("id") or f"{it.get('collection','')}-{it.get('name','')}-{it.get('url','')}")
                         if not item_id:
                             continue
                         if not _item_matches(it, st):
                             continue
-                        # антидубликат
                         inserted = await mark_sent(pool, uid, item_id)
                         if not inserted:
                             continue
                         await send_item_alert(bot, uid, it)
             await asyncio.sleep(SCAN_INTERVAL_SEC)
         except Exception:
-            # не падаем — следующая итерация
             await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 # ======== Handlers: сканер команды ========
@@ -726,11 +723,15 @@ async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
 
 async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
+    min_disc_text = f"{float(st['min_discount']):.1f}%"
+    max_price_text = "нет" if st["max_price_ton"] is None else f"{float(st['max_price_ton']):.3f} TON"
+    cols_text = ", ".join(st["collections"]) if st["collections"] else "любой"
+
     lines = [
         "Текущие фильтры сканера:",
-        f"— Мин. скидка: {float(st['min_discount']):.1f}%",
-        f"— Макс. цена: {('нет' if st['max_price_ton'] is None else f'{float(st['max_price_ton']):.3f} TON')}",
-        f"— Коллекции: {', '.join(st['collections']) if st['collections'] else 'любой'}",
+        f"— Мин. скидка: {min_disc_text}",
+        f"— Макс. цена: {max_price_text}",
+        f"— Коллекции: {cols_text}",
         "",
         "Команды настройки:",
         "/set_discount N",
@@ -799,7 +800,7 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
         return
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
     sent = 0
-    for it in items[:20]:  # ограничим 20 для теста
+    for it in items[:20]:
         if _item_matches(it, st):
             await send_item_alert(bot, m.from_user.id, it)
             sent += 1
@@ -952,4 +953,4 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
 
     # нижние кнопки
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
-    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: m.text == "О коллекции")
+    dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: м.text == "О коллекции")
