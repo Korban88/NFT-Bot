@@ -126,18 +126,15 @@ def friendly_to_raw(addr: str) -> Optional[str]:
         b = _b64url_decode_padded(addr)
         if len(b) < 34:  # ожидаем минимум tag(1)+wc(1)+hash(32)
             return None
-        tag = b[0]  # не используем
         wc = int.from_bytes(b[1:2], "big", signed=True)
         hash_part = b[2:34]
         return f"{wc}:{hash_part.hex()}"
     except Exception:
         return None
 
-def normalize_for_tonapi(addr: str) -> List[str]:
+def normalize_for_tonapi_local(addr: str) -> List[str]:
     """
-    Возвращает варианты идентификаторов аккаунта для TonAPI:
-    - исходный (как есть)
-    - raw (если смогли распарсить friendly)
+    Локальные варианты для TonAPI: исходный (как есть) + raw (если смогли собрать).
     """
     variants = []
     a = addr.strip()
@@ -166,6 +163,27 @@ class TonAPI:
         except Exception:
             return False
 
+    # --- NEW: server-side conversion via TonAPI ---
+    async def _convert_address(self, address: str) -> Dict[str, str]:
+        """
+        Возвращает формы адреса через TonAPI: bounceable/non_bounceable (b64url) и raw.
+        Даже если исходный UQ/EQ не работает в /accounts, этот эндпоинт обычно 200.
+        """
+        url = f"{self.base}/tools/convert_address?address={address}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, headers=self._headers())
+            if r.status_code != 200:
+                return {}
+            data = r.json()
+            return {
+                "bounceable": (data.get("bounceable") or {}).get("b64url") or "",
+                "non_bounceable": (data.get("non_bounceable") or {}).get("b64url") or "",
+                "raw": data.get("raw") or "",
+            }
+        except Exception:
+            return {}
+
     async def _fetch_tx(self, account_id: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
         url = f"{self.base}/accounts/{account_id}/transactions?limit={limit}"
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -176,11 +194,25 @@ class TonAPI:
         return r.status_code, None
 
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        # Пробуем исходный и локально сконвертированный raw
-        for acc in normalize_for_tonapi(address):
+        # 1) Локальные формы (исходный + raw)
+        tried: List[str] = []
+        for acc in normalize_for_tonapi_local(address):
             code, items = await self._fetch_tx(acc, limit)
             if items is not None:
                 return items
+            tried.append(f"{acc} (HTTP {code})")
+
+        # 2) Серверная конвертация TonAPI и повтор (bounceable, non_bounceable, raw)
+        forms = await self._convert_address(address)
+        for key in ["bounceable", "non_bounceable", "raw"]:
+            acc = forms.get(key)
+            if acc:
+                code, items = await self._fetch_tx(acc, limit)
+                if items is not None:
+                    return items
+                tried.append(f"{acc} (HTTP {code})")
+
+        # 3) Ничего не нашли
         return []
 
     @staticmethod
@@ -403,11 +435,24 @@ async def debug_addr_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Poo
         await m.answer("Адрес приёма не задан. Укажи его: /set_wallet <адрес TON>")
         return
 
-    variants = normalize_for_tonapi(wallet)
-    lines = [f"Исходный: {wallet}", "Варианты для TonAPI:"]
-    for v in variants:
+    # Покажем и локальные, и TonAPI-конвертированные формы
+    lines = [f"Исходный: {wallet}", "Проверка форм адреса:"]
+    checked: List[str] = []
+
+    # 1) Локальные формы
+    for v in normalize_for_tonapi_local(wallet):
         code, items = await tonapi._fetch_tx(v, limit=1)
         lines.append(f"— {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+        checked.append(v)
+
+    # 2) Формы от TonAPI
+    forms = await tonapi._convert_address(wallet)
+    for key in ["bounceable", "non_bounceable", "raw"]:
+        v = forms.get(key)
+        if v and v not in checked:
+            code, items = await tonapi._fetch_tx(v, limit=1)
+            lines.append(f"— {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+
     await m.answer("\n".join(lines))
 
 async def set_wallet_handler(m: types.Message, pool: asyncpg.Pool):
