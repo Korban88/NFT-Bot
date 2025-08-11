@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo  # локальная таймзона
 
 import httpx
 import asyncpg
@@ -23,6 +24,11 @@ TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # optional
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
 MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # прод-минималка
 PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))       # TTL платежа в минутах
+
+# >>> ВСЁ ВРЕМЯ — ПО МОСКВЕ <<<
+LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
+LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
+
 TON_DECIMALS = Decimal(10**9)
 
 # ======== Keyboards / Links ========
@@ -113,7 +119,7 @@ async def set_wallet(pool: asyncpg.Pool, address: str):
             address.strip()
         )
 
-# ======== Address utils (локальная конвертация) ========
+# ======== Address utils ========
 def _b64url_decode_padded(s: str) -> bytes:
     s = s.replace(' ', '').strip()
     pad = (-len(s)) % 4
@@ -121,10 +127,6 @@ def _b64url_decode_padded(s: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 def friendly_to_raw(addr: str) -> Optional[str]:
-    """
-    friendly (UQ.../EQ...) -> raw "wc:hex".
-    tag(1) + workchain(signed,1) + 32 bytes hash + crc16(2) — CRC игнорируем.
-    """
     try:
         b = _b64url_decode_padded(addr)
         if len(b) < 34:
@@ -217,12 +219,10 @@ class TxProvider:
         self.toncenter = toncenter
 
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        # TonAPI: локальные формы
         for acc in normalize_for_tonapi_local(address):
             _, items = await self.tonapi.fetch_tx(acc, limit)
             if items is not None:
                 return items
-        # TonAPI: конвертация (bounceable/non_bounceable/raw) и повтор
         forms = await self.tonapi.convert_address(address)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key)
@@ -230,12 +230,10 @@ class TxProvider:
                 _, items = await self.tonapi.fetch_tx(acc, limit)
                 if items is not None:
                     return items
-        # TON Center: локальные формы
         for acc in normalize_for_tonapi_local(address):
             _, items = await self.toncenter.fetch_tx(acc, limit)
             if items is not None:
                 return items
-        # TON Center: конвертированные формы (если были)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key) if forms else None
             if acc:
@@ -244,7 +242,7 @@ class TxProvider:
                     return items
         return []
 
-# ======== Parsing helpers ========
+# ======== Parsing/helpers ========
 def _to_ton(nanotons: Any) -> Optional[Decimal]:
     try:
         return Decimal(str(nanotons)) / TON_DECIMALS
@@ -304,19 +302,19 @@ def _tx_id_str(tx: Dict[str, Any]) -> str:
         return str(tx.get("lt"))
     return f"tx-{uuid.uuid4().hex[:12]}"
 
-# ======== Utils ========
-def gen_comment() -> str:
-    return f"pay-{uuid.uuid4().hex[:6]}"
-
-async def notify_admin(bot: Bot, text: str):
-    if ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(ADMIN_CHAT_ID, text)
-        except Exception:
-            pass
-
+# ---- Time helpers: всё в MSK ----
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def _to_local(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ)
+
+def _fmt_local(dt: datetime) -> str:
+    d = _to_local(dt)
+    # Пример: 2025-08-11 18:04:47 MSK
+    return d.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # ======== Business logic ========
 async def find_incoming_with_comment(
@@ -377,7 +375,8 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/debug_addr — проверить формы адреса\n"
         "/set_wallet АДРЕС — сменить адрес приёма\n"
         "/health — проверить TonAPI\n\n"
-        f"Текущий адрес приёма: {wa[:6]}…{wa[-6:] if wa else '—'}"
+        f"Текущий адрес приёма: {wa[:6]}…{wa[-6:] if wa else '—'}\n"
+        f"Локальная TZ: {LOCAL_TZ_NAME} (MSK)"
     )
     await m.answer(text, reply_markup=main_kb())
 
@@ -448,25 +447,20 @@ async def verify_handler(m: types.Message, bot: Bot, provider: TxProvider, pool:
         await m.answer("Этот платёж уже подтверждён.")
         return
 
-    # 1) Проверим блокчейн (даже если TTL просрочен — зачтём при нахождении)
     found = await find_incoming_with_comment(provider, wallet, comment, MIN_PAYMENT_TON, lookback_minutes=360)
 
-    # 2) TTL
     created_at: datetime = row["created_at"]
     ttl_expired = (_now_utc() - created_at) > timedelta(minutes=PAYMENT_TTL_MIN)
 
     if not found:
-        # Если не нашли — и TTL истёк, то помечаем expired
         if ttl_expired:
             async with pool.acquire() as con:
                 await con.execute("UPDATE app_payments SET status='expired' WHERE id=$1", row["id"])
             await m.answer("Срок действия счёта истёк. Создай новый через /pay.")
             return
-        # TTL ещё идёт — просим подождать
         await m.answer("Платёж не найден. Если платил только что — подожди 1–2 минуты и повтори `/verify ...`.")
         return
 
-    # Нашли оплату — подтверждаем, даже если TTL прошёл (лояльно к пользователю)
     tx_id, amount_ton = found
     try:
         async with pool.acquire() as con:
@@ -483,11 +477,12 @@ async def verify_handler(m: types.Message, bot: Bot, provider: TxProvider, pool:
         await m.answer(f"Оплата найдена ({amount_ton} TON), но возникла ошибка сохранения. Сообщи поддержку. Код: {e}")
         return
 
+    now = _now_utc()
     receipt = (
         "Оплата подтверждена.\n"
         f"Сумма: {amount_ton} TON\n"
         f"Tx: {tx_id}\n"
-        f"Дата: {_now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        f"Дата: {_fmt_local(now)}\n\n"
         "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
     await m.answer(receipt)
@@ -510,9 +505,13 @@ async def payments_handler(m: types.Message, pool: asyncpg.Pool):
         amt = float(r["amount_ton"])
         cmt = r["comment"]
         txh = r["tx_hash"] or "—"
-        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
-        paid = r["paid_at"].strftime("%Y-%m-%d %H:%M:%S UTC") if r["paid_at"] else "—"
-        lines.append(f"• {status} | {amt:.3f} TON | {cmt}\n  tx: {txh}\n  created: {created} | paid: {paid}")
+        created_local = _fmt_local(r["created_at"])
+        paid_local = _fmt_local(r["paid_at"]) if r["paid_at"] else "—"
+        lines.append(
+            f"• {status} | {amt:.3f} TON | {cmt}\n"
+            f"  tx: {txh}\n"
+            f"  created: {created_local} | paid: {paid_local}"
+        )
 
     await m.answer("\n".join(lines))
 
@@ -536,7 +535,8 @@ async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg
         when = "—"
         if utime is not None:
             try:
-                when = datetime.fromtimestamp(int(utime), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                dt_utc = datetime.fromtimestamp(int(utime), tz=timezone.utc)
+                when = _fmt_local(dt_utc)  # показываем локально (MSK)
             except Exception:
                 when = "—"
 
@@ -606,29 +606,6 @@ async def set_wallet_handler(m: types.Message, pool: asyncpg.Pool):
     await set_wallet(pool, address)
     await m.answer(f"Ок! Адрес приёма обновлён: {address[:6]}…{address[-6:]}")
 
-async def payments_handler(m: types.Message, pool: asyncpg.Pool):
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            "SELECT status, amount_ton, comment, tx_hash, created_at, paid_at "
-            "FROM app_payments WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5",
-            m.from_user.id
-        )
-    if not rows:
-        await m.answer("У тебя пока нет платежей.")
-        return
-
-    lines = ["Последние платежи:"]
-    for r in rows:
-        status = r["status"]
-        amt = float(r["amount_ton"])
-        cmt = r["comment"]
-        txh = r["tx_hash"] or "—"
-        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
-        paid = r["paid_at"].strftime("%Y-%m-%d %H:%M:%S UTC") if r["paid_at"] else "—"
-        lines.append(f"• {status} | {amt:.3f} TON | {cmt}\n  tx: {txh}\n  created: {created} | paid: {paid}")
-
-    await m.answer("\n".join(lines))
-
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         total_paid = await con.fetchval(
@@ -647,7 +624,7 @@ async def profile_handler(m: types.Message, pool: asyncpg.Pool):
         "Последняя оплата:"
     ]
     if last_tx:
-        txt.append(f"— {float(last_tx['amount_ton']):.3f} TON, {last_tx['paid_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        txt.append(f"— {float(last_tx['amount_ton']):.3f} TON, {_fmt_local(last_tx['paid_at'])}")
     else:
         txt.append("— пока пусто")
     await m.answer("\n".join(txt))
