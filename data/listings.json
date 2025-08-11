@@ -1,0 +1,20 @@
+[
+  {
+    "name": "FLIGHT #001",
+    "collection": "FLIGHT",
+    "price_ton": 8.5,
+    "floor_ton": 12.0,
+    "timestamp": 1754932200,
+    "url": "https://example.com/flight/001",
+    "image": "https://picsum.photos/seed/flight001/600/400"
+  },
+  {
+    "name": "FLIGHT #002",
+    "collection": "FLIGHT",
+    "price_ton": 9.0,
+    "floor_ton": 12.0,
+    "timestamp": 1754932800,
+    "url": "https://example.com/flight/002",
+    "image": "https://picsum.photos/seed/flight002/600/400"
+  }
+]
