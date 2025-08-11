@@ -5,9 +5,11 @@ import logging
 
 import asyncpg
 from aiogram import Bot, Dispatcher, executor
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-from handlers import register_handlers
-
+from config import settings
+from db import get_pool, init_db
+from handlers import register_handlers, scanner_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,42 +17,40 @@ logging.basicConfig(
 )
 log = logging.getLogger("nftbot")
 
-
-def require_env(name: str) -> str:
-    val = os.getenv(name)
+def require_env(name: str):
+    val = os.getenv(name) or ""
     if not val:
-        raise RuntimeError(f"ENV {name} is not set")
+        raise RuntimeError(f"{name} is empty")
     return val
 
-
 def main():
-    # --- ENV ---
-    bot_token = require_env("BOT_TOKEN")
-    db_url = require_env("DATABASE_URL")
+    require_env("BOT_TOKEN")
+    require_env("DATABASE_URL")
 
-    # --- Aiogram ---
-    bot = Bot(token=bot_token, parse_mode="HTML")
-    dp = Dispatcher(bot)
+    bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher(bot, storage=MemoryStorage())
 
-    # --- Event loop / DB pool ---
     loop = asyncio.get_event_loop()
-    pool = loop.run_until_complete(asyncpg.create_pool(dsn=db_url, min_size=1, max_size=5))
-    log.info("✅ Подключение к базе данных успешно.")
 
-    # --- Handlers ---
-    register_handlers(dp, bot, pool)
+    async def _on_startup(dp_: Dispatcher):
+        pool = await get_pool()
+        await init_db()
+        # регистрируем handlers уже зная pool/bot
+        register_handlers(dp, bot, pool)
+        # запускаем фоновый сканер
+        loop.create_task(scanner_loop(bot, pool))
+        log.info("Scanner loop started.")
 
-    # --- Shutdown hook ---
     async def _on_shutdown(dp_: Dispatcher):
         try:
+            pool = await get_pool()
             await pool.close()
             log.info("DB pool closed.")
         except Exception as e:
             log.warning(f"DB pool close error: {e}")
 
-    log.info("Starting NFT bot (Iteration 1 / Step 1)...")
-    executor.start_polling(dp, skip_updates=True, on_shutdown=_on_shutdown)
-
+    log.info("Starting NFT bot (Scanner v1)...")
+    executor.start_polling(dp, skip_updates=True, on_startup=_on_startup, on_shutdown=_on_shutdown)
 
 if __name__ == "__main__":
     main()
