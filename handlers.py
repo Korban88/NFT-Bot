@@ -19,7 +19,8 @@ from aiogram.types import (
 # ======== Config ========
 ENV_WALLET = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # TON (понижена для тестов)
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # опционально
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # TON (понижено для тестов)
 TON_DECIMALS = Decimal(10**9)
 
 # ======== Keyboards / Links ========
@@ -134,7 +135,7 @@ def friendly_to_raw(addr: str) -> Optional[str]:
 
 def normalize_for_tonapi_local(addr: str) -> List[str]:
     """
-    Локальные варианты для TonAPI: исходный (как есть) + raw (если смогли собрать).
+    Локальные варианты для запросов: исходный (как есть) + raw (если смогли собрать).
     """
     variants = []
     a = addr.strip()
@@ -145,7 +146,7 @@ def normalize_for_tonapi_local(addr: str) -> List[str]:
             variants.append(raw)
     return variants
 
-# ======== TonAPI ========
+# ======== Providers ========
 class TonAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -163,11 +164,9 @@ class TonAPI:
         except Exception:
             return False
 
-    # --- Server-side conversion via TonAPI ---
-    async def _convert_address(self, address: str) -> Dict[str, str]:
+    async def convert_address(self, address: str) -> Dict[str, str]:
         """
-        Возвращает формы адреса через TonAPI: bounceable/non_bounceable (b64url) и raw.
-        Даже если исходный UQ/EQ не работает в /accounts, этот эндпоинт обычно 200.
+        Возвращает формы адреса через TonAPI (если доступно).
         """
         url = f"{self.base}/tools/convert_address?address={address}"
         try:
@@ -184,7 +183,7 @@ class TonAPI:
         except Exception:
             return {}
 
-    async def _fetch_tx(self, account_id: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+    async def fetch_tx(self, account_id: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
         url = f"{self.base}/accounts/{account_id}/transactions?limit={limit}"
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, headers=self._headers())
@@ -193,88 +192,153 @@ class TonAPI:
             return r.status_code, (data.get("transactions", []) or data.get("items", []) or [])
         return r.status_code, None
 
+class TonCenter:
+    """
+    Фолбэк‑провайдер. Документация: https://toncenter.com/api/v2/
+    Метод: getTransactions (HTTP GET) — адрес в user-friendly или raw.
+    """
+    def __init__(self, api_key: str):
+        self.base = "https://toncenter.com/api/v2/"
+        self.api_key = api_key
+
+    async def fetch_tx(self, address: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+        params = {
+            "address": address,
+            "limit": min(limit, 100),
+            "archival": "true"
+        }
+        if self.api_key:
+            params["api_key"] = self.api_key
+        url = self.base + "getTransactions"
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, params=params)
+        if r.status_code != 200:
+            return r.status_code, None
+        data = r.json() or {}
+        # TonCenter формат: {"ok": true, "result": [ ... ]} либо {"ok": false, "error": "..."}
+        if not data.get("ok"):
+            return 200, []
+        return 200, data.get("result") or []
+
+# ======== Unified access layer ========
+class TxProvider:
+    def __init__(self, tonapi: TonAPI, toncenter: TonCenter):
+        self.tonapi = tonapi
+        self.toncenter = toncenter
+
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        # 1) Локальные формы (исходный + raw)
+        # 1) TonAPI: локальные формы
         for acc in normalize_for_tonapi_local(address):
-            code, items = await self._fetch_tx(acc, limit)
+            code, items = await self.tonapi.fetch_tx(acc, limit)
             if items is not None:
                 return items
-
-        # 2) Серверная конвертация TonAPI и повтор (bounceable, non_bounceable, raw)
-        forms = await self._convert_address(address)
+        # 2) TonAPI: конвертация и повтор (bounceable, non_bounceable, raw)
+        forms = await self.tonapi.convert_address(address)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key)
             if acc:
-                code, items = await self._fetch_tx(acc, limit)
+                code, items = await self.tonapi.fetch_tx(acc, limit)
                 if items is not None:
                     return items
-
-        # 3) Ничего не нашли
+        # 3) Fallback: TON Center — локальные формы
+        for acc in normalize_for_tonapi_local(address):
+            code, items = await self.toncenter.fetch_tx(acc, limit)
+            if items is not None:
+                return items
+        # 4) Fallback: TON Center — формы после конвертации TonAPI (если были)
+        for key in ["bounceable", "non_bounceable", "raw"]:
+            acc = forms.get(key) if forms else None
+            if acc:
+                code, items = await self.toncenter.fetch_tx(acc, limit)
+                if items is not None:
+                    return items
         return []
 
-    @staticmethod
-    def _to_ton(nanotons: Any) -> Optional[Decimal]:
-        try:
-            return Decimal(str(nanotons)) / TON_DECIMALS
-        except (InvalidOperation, TypeError):
-            return None
-
-    @staticmethod
-    def _extract_comment(msg: Dict[str, Any]) -> str:
-        return str(
-            msg.get("message")
-            or msg.get("comment")
-            or msg.get("decoded_body", {}).get("text")
-            or msg.get("decoded", {}).get("body", {}).get("text")
-            or ""
-        ).strip()
-
-    @staticmethod
-    def _extract_amount_ton(msg: Dict[str, Any]) -> Optional[Decimal]:
-        for candidate in [
-            msg.get("value"),
-            msg.get("amount"),
-            msg.get("decoded_body", {}).get("amount"),
-            msg.get("decoded", {}).get("body", {}).get("amount"),
-        ]:
-            ton = TonAPI._to_ton(candidate)
-            if ton is not None:
-                return ton
+# ======== Parsing helpers ========
+def _to_ton(nanotons: Any) -> Optional[Decimal]:
+    try:
+        return Decimal(str(nanotons)) / TON_DECIMALS
+    except (InvalidOperation, TypeError):
         return None
 
-    async def find_incoming_with_comment(
-        self, address: str, comment: str, min_amount_ton: Decimal, lookback_minutes: int = 360
-    ) -> Optional[Tuple[str, Decimal]]:
-        since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-        items = await self.list_recent(address, limit=100)
-        if not items:
-            return None
+def _extract_comment_from_msg(msg: Dict[str, Any]) -> str:
+    # TonAPI поля
+    for k in ["message", "comment"]:
+        if msg.get(k):
+            return str(msg.get(k)).strip()
+    for path in [
+        ("decoded_body", "text"),
+        ("decoded", "body", "text"),
+        ("msg_data", "text"),              # TonCenter
+        ("body", "text"),                  # возможный вариант
+    ):
+        cur = msg
+        ok = True
+        for p in path:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, (str, int, float)):
+            return str(cur).strip()
+    return ""
 
-        wanted = comment.strip().lower()
+def _extract_amount_from_msg(msg: Dict[str, Any]) -> Optional[Decimal]:
+    # TonAPI / TonCenter возможные поля
+    for candidate in [
+        msg.get("value"),
+        msg.get("amount"),
+        (msg.get("msg_data") or {}).get("amount"),
+        (msg.get("decoded_body") or {}).get("amount"),
+        (msg.get("decoded") or {}).get("body", {}).get("amount"),
+    ]:
+        ton = _to_ton(candidate)
+        if ton is not None:
+            return ton
+    return None
 
-        for tx in items:
-            utime = tx.get("utime") or tx.get("timestamp")
-            if utime:
+# ======== Business logic ========
+async def find_incoming_with_comment(provider: TxProvider, address: str, comment: str,
+                                     min_amount_ton: Decimal, lookback_minutes: int = 360
+                                     ) -> Optional[Tuple[str, Decimal]]:
+    since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    items = await provider.list_recent(address, limit=100)
+    if not items:
+        return None
+
+    wanted = comment.strip().lower()
+
+    for tx in items:
+        utime = tx.get("utime") or tx.get("timestamp") or tx.get("now") or tx.get("created_at")
+        if utime:
+            try:
                 tx_dt = datetime.fromtimestamp(int(utime), tz=timezone.utc)
-                if tx_dt < since_dt:
-                    continue
+            except Exception:
+                tx_dt = None
+            if tx_dt and tx_dt < since_dt:
+                continue
 
-            tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or "unknown"
+        tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or \
+                  (tx.get("transaction_id", {}) or {}).get("hash") or "unknown"
 
-            msgs: List[Dict[str, Any]] = []
-            if isinstance(tx.get("in_msg"), dict):
-                msgs.append(tx["in_msg"])
-            if isinstance(tx.get("out_msgs"), list):
-                msgs.extend([m for m in tx["out_msgs"] if isinstance(m, dict)])
-            if isinstance(tx.get("messages"), list):
-                msgs.extend([m for m in tx["messages"] if isinstance(m, dict)])
+        # Нормализуем список сообщений
+        msgs: List[Dict[str, Any]] = []
+        for key in ["in_msg", "in_msg_desc", "inMessage", "inMessageDesc"]:
+            if isinstance(tx.get(key), dict):
+                msgs.append(tx[key])
+        for key in ["out_msgs", "outMessages", "out_messages"]:
+            if isinstance(tx.get(key), list):
+                msgs.extend([m for m in tx[key] if isinstance(m, dict)])
+        if isinstance(tx.get("messages"), list):
+            msgs.extend([m for m in tx["messages"] if isinstance(m, dict)])
 
-            for msg in msgs:
-                cmt = self._extract_comment(msg).lower()
-                amt = self._extract_amount_ton(msg)
-                if cmt == wanted and amt is not None and amt >= min_amount_ton:
-                    return tx_hash, amt
-        return None
+        for msg in msgs:
+            cmt = _extract_comment_from_msg(msg).lower()
+            amt = _extract_amount_from_msg(msg)
+            if cmt == wanted and amt is not None and amt >= min_amount_ton:
+                return tx_hash, amt
+    return None
 
 # ======== Utils ========
 def gen_comment() -> str:
@@ -300,8 +364,9 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
     )
     await m.answer(text, reply_markup=main_kb())
 
-async def health_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
-    ok = await tonapi.health()
+async def health_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
+    # Простая проверка TonAPI (оставим как было)
+    ok = await provider.tonapi.health()
     wa = await get_wallet(pool)
     await m.answer(
         "Health:\n"
@@ -337,7 +402,7 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
     )
     await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(ton_link, tk_link, th_link))
 
-async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
+async def verify_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Укажи комментарий, например: `/verify pay-xxxxxx`", parse_mode="Markdown")
@@ -361,7 +426,7 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         await m.answer("Этот платёж уже подтверждён.")
         return
 
-    found = await tonapi.find_incoming_with_comment(wallet, comment, MIN_PAYMENT_TON, lookback_minutes=360)
+    found = await find_incoming_with_comment(provider, wallet, comment, MIN_PAYMENT_TON, lookback_minutes=360)
     if not found:
         await m.answer("Платёж не найден. Проверь комментарий, сумму и адрес. Если платил только что — подожди 1–2 минуты и попробуй ещё раз.")
         return
@@ -385,34 +450,37 @@ async def verify_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
         "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
 
-async def debug_tx_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
+async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
     if not wallet:
         await m.answer("Адрес приёма не задан. Укажи его: /set_wallet <адрес TON>")
         return
-    items = await tonapi.list_recent(wallet, limit=10)
+    items = await provider.list_recent(wallet, limit=10)
     if not items:
-        await m.answer("Нет данных по транзакциям (TonAPI вернул пусто). Проверь адрес/задержку сети.")
+        await m.answer("Нет данных по транзакциям. Проверь адрес/задержку сети или сделай недавний перевод.")
         return
 
     lines = ["Последние транзакции:"]
     shown = 0
     for tx in items[:5]:
-        tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or "unknown"
-        utime = tx.get("utime") or tx.get("timestamp")
+        tx_hash = tx.get("hash") or tx.get("transaction_id") or tx.get("lt") or \
+                  (tx.get("transaction_id", {}) or {}).get("hash") or "unknown"
+        utime = tx.get("utime") or tx.get("timestamp") or tx.get("now") or tx.get("created_at")
         when = datetime.fromtimestamp(int(utime), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if utime else "—"
         msgs: List[Dict[str, Any]] = []
-        if isinstance(tx.get("in_msg"), dict):
-            msgs.append(tx["in_msg"])
-        if isinstance(tx.get("out_msgs"), list):
-            msgs.extend([m for m in tx["out_msgs"] if isinstance(m, dict)])
+        for key in ["in_msg", "in_msg_desc"]:
+            if isinstance(tx.get(key), dict):
+                msgs.append(tx[key])
+        for key in ["out_msgs"]:
+            if isinstance(tx.get(key), list):
+                msgs.extend([m for m in tx[key] if isinstance(m, dict)])
         if isinstance(tx.get("messages"), list):
             msgs.extend([m for m in tx["messages"] if isinstance(m, dict)])
 
         found_any = False
         for msg in msgs:
-            cmt = TonAPI._extract_comment(msg)
-            amt = TonAPI._extract_amount_ton(msg)
+            cmt = _extract_comment_from_msg(msg)
+            amt = _extract_amount_from_msg(msg)
             if cmt or amt is not None:
                 lines.append(f"• {when} | {tx_hash}\n  comment: {cmt or '—'}\n  amount: {amt if amt is not None else '—'} TON")
                 found_any = True
@@ -426,7 +494,7 @@ async def debug_tx_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool)
 
     await m.answer("\n".join(lines))
 
-async def debug_addr_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Pool):
+async def debug_addr_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
     if not wallet:
         await m.answer("Адрес приёма не задан. Укажи его: /set_wallet <адрес TON>")
@@ -435,19 +503,31 @@ async def debug_addr_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Poo
     lines = [f"Исходный: {wallet}", "Проверка форм адреса:"]
     checked: List[str] = []
 
-    # 1) Локальные формы
+    # 1) Локальные формы — TonAPI
     for v in normalize_for_tonapi_local(wallet):
-        code, items = await tonapi._fetch_tx(v, limit=1)
-        lines.append(f"— {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+        code, items = await provider.tonapi.fetch_tx(v, limit=1)
+        lines.append(f"— TonAPI {v} -> HTTP {code}, items={'yes' if items else 'no'}")
         checked.append(v)
 
-    # 2) Формы от TonAPI
-    forms = await tonapi._convert_address(wallet)
+    # 2) Конвертация через TonAPI и повтор — TonAPI
+    forms = await provider.tonapi.convert_address(wallet)
     for key in ["bounceable", "non_bounceable", "raw"]:
         v = forms.get(key)
-        if v and v not in checked:
-            code, items = await tonapi._fetch_tx(v, limit=1)
-            lines.append(f"— {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+        if v:
+            code, items = await provider.tonapi.fetch_tx(v, limit=1)
+            lines.append(f"— TonAPI {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+
+    # 3) Локальные формы — TON Center
+    for v in normalize_for_tonapi_local(wallet):
+        code, items = await provider.toncenter.fetch_tx(v, limit=1)
+        lines.append(f"— TONCENTER {v} -> HTTP {code}, items={'yes' if items else 'no'}")
+
+    # 4) Конвертированные формы — TON Center
+    for key in ["bounceable", "non_bounceable", "raw"]:
+        v = forms.get(key) if forms else None
+        if v:
+            code, items = await provider.toncenter.fetch_tx(v, limit=1)
+            lines.append(f"— TONCENTER {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
 
     await m.answer("\n".join(lines))
 
@@ -515,15 +595,18 @@ async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
 # ======== Router ========
 def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     tonapi = TonAPI(TONAPI_KEY)
+    toncenter = TonCenter(TONCENTER_API_KEY)
+    provider = TxProvider(tonapi, toncenter)
+
     loop = asyncio.get_event_loop()
     loop.create_task(ensure_tables(pool))
 
     dp.register_message_handler(lambda m: start_handler(m, pool), commands={"start"})
-    dp.register_message_handler(lambda m: health_handler(m, tonapi, pool), commands={"health"})
+    dp.register_message_handler(lambda m: health_handler(m, provider, pool), commands={"health"})
     dp.register_message_handler(lambda m: pay_handler(m, pool), commands={"pay"})
-    dp.register_message_handler(lambda m: verify_handler(m, tonapi, pool), commands={"verify"})
-    dp.register_message_handler(lambda m: debug_tx_handler(m, tonapi, pool), commands={"debug_tx"})
-    dp.register_message_handler(lambda m: debug_addr_handler(m, tonapi, pool), commands={"debug_addr"})
+    dp.register_message_handler(lambda m: verify_handler(m, provider, pool), commands={"verify"})
+    dp.register_message_handler(lambda m: debug_tx_handler(m, provider, pool), commands={"debug_tx"})
+    dp.register_message_handler(lambda m: debug_addr_handler(m, provider, pool), commands={"debug_addr"})
     dp.register_message_handler(lambda m: set_wallet_handler(m, pool), commands={"set_wallet"})
     dp.register_message_handler(lambda m: profile_handler(m, pool), lambda m: m.text == "Мой профиль")
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), commands={"scanner_on"})
