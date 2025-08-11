@@ -20,7 +20,9 @@ from aiogram.types import (
 ENV_WALLET = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # optional
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # lowered for tests
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # прод-минималка
+PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))       # TTL платежа в минутах
 TON_DECIMALS = Decimal(10**9)
 
 # ======== Keyboards / Links ========
@@ -220,7 +222,7 @@ class TxProvider:
             _, items = await self.tonapi.fetch_tx(acc, limit)
             if items is not None:
                 return items
-        # TonAPI: серверная конвертация (bounceable/non_bounceable/raw) и повтор
+        # TonAPI: конвертация (bounceable/non_bounceable/raw) и повтор
         forms = await self.tonapi.convert_address(address)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key)
@@ -285,12 +287,7 @@ def _extract_amount_from_msg(msg: Dict[str, Any]) -> Optional[Decimal]:
     return None
 
 def _tx_id_str(tx: Dict[str, Any]) -> str:
-    """
-    Нормализованный ID транзакции как строка.
-    TonAPI: hash|lt
-    TonCenter: transaction_id: { hash, lt }
-    """
-    # TonCenter object first
+    # Нормализованный ID (строка) для TonAPI/TonCenter
     tid = tx.get("transaction_id")
     if isinstance(tid, dict):
         h = tid.get("hash")
@@ -301,20 +298,32 @@ def _tx_id_str(tx: Dict[str, Any]) -> str:
             return str(h)
         if lt:
             return str(lt)
-    # Plain fields
     if isinstance(tx.get("hash"), (str, bytes)):
         return tx["hash"] if isinstance(tx["hash"], str) else tx["hash"].decode("utf-8", "ignore")
     if "lt" in tx and not isinstance(tx.get("lt"), dict):
         return str(tx.get("lt"))
-    # Fallback
     return f"tx-{uuid.uuid4().hex[:12]}"
+
+# ======== Utils ========
+def gen_comment() -> str:
+    return f"pay-{uuid.uuid4().hex[:6]}"
+
+async def notify_admin(bot: Bot, text: str):
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text)
+        except Exception:
+            pass
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 # ======== Business logic ========
 async def find_incoming_with_comment(
     provider: TxProvider, address: str, comment: str,
     min_amount_ton: Decimal, lookback_minutes: int = 360
 ) -> Optional[Tuple[str, Decimal]]:
-    since_dt = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    since_dt = _now_utc() - timedelta(minutes=lookback_minutes)
     items = await provider.list_recent(address, limit=100)
     if not items:
         return None
@@ -351,10 +360,6 @@ async def find_incoming_with_comment(
                 return tx_id, amt
     return None
 
-# ======== Utils ========
-def gen_comment() -> str:
-    return f"pay-{uuid.uuid4().hex[:6]}"
-
 # ======== Handlers ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await upsert_user(pool, m.from_user.id)
@@ -367,6 +372,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/scanner_settings — настройки фильтров\n"
         "/pay — ссылка на оплату (есть web‑кнопки)\n"
         "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
+        "/payments — последние платежи\n"
         "/debug_tx — последние транзакции (отладка)\n"
         "/debug_addr — проверить формы адреса\n"
         "/set_wallet АДРЕС — сменить адрес приёма\n"
@@ -384,7 +390,7 @@ async def health_handler(m: types.Message, provider: TxProvider, pool: asyncpg.P
         f"Wallet: {wa[:6]}…{wa[-6:] if wa else '—'}"
     )
 
-async def pay_handler(m: types.Message, pool: asyncpg.Pool):
+async def pay_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
     if not wallet:
         await m.answer("Адрес приёма не задан. Укажи его командой: /set_wallet <адрес TON>")
@@ -401,18 +407,22 @@ async def pay_handler(m: types.Message, pool: asyncpg.Pool):
             uuid.uuid4(), m.from_user.id, comment, float(MIN_PAYMENT_TON)
         )
 
+    ttl_text = f"{PAYMENT_TTL_MIN} мин"
     msg = (
         "Оплата доступа/покупки.\n\n"
         f"Сумма: {MIN_PAYMENT_TON} TON или больше\n"
         f"Комментарий: `{comment}`\n"
-        f"Адрес: `{wallet}`\n\n"
+        f"Адрес: `{wallet}`\n"
+        f"Срок действия счёта: {ttl_text}\n\n"
         "Если ссылка ниже не открывается на ПК — используй кнопки Tonkeeper/Tonhub (web) "
         "или оплати вручную из @wallet: вставь адрес и комментарий как указано выше.\n\n"
         f"После оплаты запусти: `/verify {comment}`"
     )
     await m.answer(msg, parse_mode="Markdown", reply_markup=pay_kb(ton_link, tk_link, th_link))
 
-async def verify_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
+    await notify_admin(bot, f"🧾 Новый счёт: user={m.from_user.id}, amount≥{float(MIN_PAYMENT_TON)} TON, comment={comment}")
+
+async def verify_handler(m: types.Message, bot: Bot, provider: TxProvider, pool: asyncpg.Pool):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Укажи комментарий, например: `/verify pay-xxxxxx`", parse_mode="Markdown")
@@ -426,21 +436,37 @@ async def verify_handler(m: types.Message, provider: TxProvider, pool: asyncpg.P
 
     async with pool.acquire() as con:
         row = await con.fetchrow(
-            "SELECT id, status FROM app_payments WHERE user_id=$1 AND comment=$2 ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, status, created_at FROM app_payments WHERE user_id=$1 AND comment=$2 ORDER BY created_at DESC LIMIT 1",
             m.from_user.id, comment
         )
+
     if not row:
         await m.answer("Платёж с таким комментарием у тебя не найден. Создай новый через /pay.")
         return
+
     if row["status"] == "paid":
         await m.answer("Этот платёж уже подтверждён.")
         return
 
+    # 1) Проверим блокчейн (даже если TTL просрочен — зачтём при нахождении)
     found = await find_incoming_with_comment(provider, wallet, comment, MIN_PAYMENT_TON, lookback_minutes=360)
+
+    # 2) TTL
+    created_at: datetime = row["created_at"]
+    ttl_expired = (_now_utc() - created_at) > timedelta(minutes=PAYMENT_TTL_MIN)
+
     if not found:
-        await m.answer("Платёж не найден. Проверь комментарий, сумму и адрес. Если платил только что — подожди 1–2 минуты и попробуй ещё раз.")
+        # Если не нашли — и TTL истёк, то помечаем expired
+        if ttl_expired:
+            async with pool.acquire() as con:
+                await con.execute("UPDATE app_payments SET status='expired' WHERE id=$1", row["id"])
+            await m.answer("Срок действия счёта истёк. Создай новый через /pay.")
+            return
+        # TTL ещё идёт — просим подождать
+        await m.answer("Платёж не найден. Если платил только что — подожди 1–2 минуты и повтори `/verify ...`.")
         return
 
+    # Нашли оплату — подтверждаем, даже если TTL прошёл (лояльно к пользователю)
     tx_id, amount_ton = found
     try:
         async with pool.acquire() as con:
@@ -457,12 +483,38 @@ async def verify_handler(m: types.Message, provider: TxProvider, pool: asyncpg.P
         await m.answer(f"Оплата найдена ({amount_ton} TON), но возникла ошибка сохранения. Сообщи поддержку. Код: {e}")
         return
 
-    await m.answer(
+    receipt = (
         "Оплата подтверждена.\n"
         f"Сумма: {amount_ton} TON\n"
-        f"Tx: {tx_id}\n\n"
+        f"Tx: {tx_id}\n"
+        f"Дата: {_now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
         "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
+    await m.answer(receipt)
+    await notify_admin(bot, f"✅ Оплата подтверждена: user={m.from_user.id}, amount={amount_ton} TON, comment={comment}, tx={tx_id}")
+
+async def payments_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT status, amount_ton, comment, tx_hash, created_at, paid_at "
+            "FROM app_payments WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5",
+            m.from_user.id
+        )
+    if not rows:
+        await m.answer("У тебя пока нет платежей.")
+        return
+
+    lines = ["Последние платежи:"]
+    for r in rows:
+        status = r["status"]
+        amt = float(r["amount_ton"])
+        cmt = r["comment"]
+        txh = r["tx_hash"] or "—"
+        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
+        paid = r["paid_at"].strftime("%Y-%m-%d %H:%M:%S UTC") if r["paid_at"] else "—"
+        lines.append(f"• {status} | {amt:.3f} TON | {cmt}\n  tx: {txh}\n  created: {created} | paid: {paid}")
+
+    await m.answer("\n".join(lines))
 
 async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
@@ -554,6 +606,29 @@ async def set_wallet_handler(m: types.Message, pool: asyncpg.Pool):
     await set_wallet(pool, address)
     await m.answer(f"Ок! Адрес приёма обновлён: {address[:6]}…{address[-6:]}")
 
+async def payments_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT status, amount_ton, comment, tx_hash, created_at, paid_at "
+            "FROM app_payments WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5",
+            m.from_user.id
+        )
+    if not rows:
+        await m.answer("У тебя пока нет платежей.")
+        return
+
+    lines = ["Последние платежи:"]
+    for r in rows:
+        status = r["status"]
+        amt = float(r["amount_ton"])
+        cmt = r["comment"]
+        txh = r["tx_hash"] or "—"
+        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
+        paid = r["paid_at"].strftime("%Y-%m-%d %H:%M:%S UTC") if r["paid_at"] else "—"
+        lines.append(f"• {status} | {amt:.3f} TON | {cmt}\n  tx: {txh}\n  created: {created} | paid: {paid}")
+
+    await m.answer("\n".join(lines))
+
 async def profile_handler(m: types.Message, pool: asyncpg.Pool):
     async with pool.acquire() as con:
         total_paid = await con.fetchval(
@@ -614,8 +689,9 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
 
     dp.register_message_handler(lambda m: start_handler(m, pool), commands={"start"})
     dp.register_message_handler(lambda m: health_handler(m, provider, pool), commands={"health"})
-    dp.register_message_handler(lambda m: pay_handler(m, pool), commands={"pay"})
-    dp.register_message_handler(lambda m: verify_handler(m, provider, pool), commands={"verify"})
+    dp.register_message_handler(lambda m: pay_handler(m, bot, pool), commands={"pay"})
+    dp.register_message_handler(lambda m: verify_handler(m, bot, provider, pool), commands={"verify"})
+    dp.register_message_handler(lambda m: payments_handler(m, pool), commands={"payments"})
     dp.register_message_handler(lambda m: debug_tx_handler(m, provider, pool), commands={"debug_tx"})
     dp.register_message_handler(lambda m: debug_addr_handler(m, provider, pool), commands={"debug_addr"})
     dp.register_message_handler(lambda m: set_wallet_handler(m, pool), commands={"set_wallet"})
