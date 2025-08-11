@@ -19,8 +19,8 @@ from aiogram.types import (
 # ======== Config ========
 ENV_WALLET = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # опционально
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # для тестов lowered
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # optional
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # lowered for tests
 TON_DECIMALS = Decimal(10**9)
 
 # ======== Keyboards / Links ========
@@ -120,8 +120,8 @@ def _b64url_decode_padded(s: str) -> bytes:
 
 def friendly_to_raw(addr: str) -> Optional[str]:
     """
-    Конвертирует friendly (UQ.../EQ...) в raw "wc:hex".
-    Формат: tag(1) + workchain(signed,1) + 32 bytes hash + crc16(2) — CRC игнорируем.
+    friendly (UQ.../EQ...) -> raw "wc:hex".
+    tag(1) + workchain(signed,1) + 32 bytes hash + crc16(2) — CRC игнорируем.
     """
     try:
         b = _b64url_decode_padded(addr)
@@ -134,9 +134,6 @@ def friendly_to_raw(addr: str) -> Optional[str]:
         return None
 
 def normalize_for_tonapi_local(addr: str) -> List[str]:
-    """
-    Локальные варианты: исходный (как есть) + raw (если смогли собрать).
-    """
     variants: List[str] = []
     a = (addr or "").strip()
     if a:
@@ -165,9 +162,6 @@ class TonAPI:
             return False
 
     async def convert_address(self, address: str) -> Dict[str, str]:
-        """
-        Вернёт формы адреса через TonAPI: bounceable/non_bounceable (b64url) и raw.
-        """
         url = f"{self.base}/tools/convert_address?address={address}"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -211,7 +205,7 @@ class TonCenter:
             return r.status_code, None
         data = r.json() or {}
         if not data.get("ok"):
-            return 200, []  # возвращаем "пусто", но без ошибки
+            return 200, []
         return 200, data.get("result") or []
 
 # ======== Unified access layer ========
@@ -221,12 +215,12 @@ class TxProvider:
         self.toncenter = toncenter
 
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
-        # 1) TonAPI: локальные формы
+        # TonAPI: локальные формы
         for acc in normalize_for_tonapi_local(address):
             _, items = await self.tonapi.fetch_tx(acc, limit)
             if items is not None:
                 return items
-        # 2) TonAPI: серверная конвертация (bounceable/non_bounceable/raw) и повтор
+        # TonAPI: серверная конвертация (bounceable/non_bounceable/raw) и повтор
         forms = await self.tonapi.convert_address(address)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key)
@@ -234,12 +228,12 @@ class TxProvider:
                 _, items = await self.tonapi.fetch_tx(acc, limit)
                 if items is not None:
                     return items
-        # 3) TON Center: локальные формы
+        # TON Center: локальные формы
         for acc in normalize_for_tonapi_local(address):
             _, items = await self.toncenter.fetch_tx(acc, limit)
             if items is not None:
                 return items
-        # 4) TON Center: сконвертированные формы (если были)
+        # TON Center: конвертированные формы (если были)
         for key in ["bounceable", "non_bounceable", "raw"]:
             acc = forms.get(key) if forms else None
             if acc:
@@ -248,7 +242,7 @@ class TxProvider:
                     return items
         return []
 
-# ======== Parsing helpers (унифицировано для TonAPI / TonCenter) ========
+# ======== Parsing helpers ========
 def _to_ton(nanotons: Any) -> Optional[Decimal]:
     try:
         return Decimal(str(nanotons)) / TON_DECIMALS
@@ -259,11 +253,10 @@ def _extract_comment_from_msg(msg: Dict[str, Any]) -> str:
     for k in ["message", "comment"]:
         if msg.get(k):
             return str(msg.get(k)).strip()
-    # nested paths
     for path in [
         ("decoded_body", "text"),
         ("decoded", "body", "text"),
-        ("msg_data", "text"),
+        ("msg_data", "text"),   # TonCenter
         ("body", "text"),
     ]:
         cur: Any = msg
@@ -291,6 +284,31 @@ def _extract_amount_from_msg(msg: Dict[str, Any]) -> Optional[Decimal]:
             return ton
     return None
 
+def _tx_id_str(tx: Dict[str, Any]) -> str:
+    """
+    Нормализованный ID транзакции как строка.
+    TonAPI: hash|lt
+    TonCenter: transaction_id: { hash, lt }
+    """
+    # TonCenter object first
+    tid = tx.get("transaction_id")
+    if isinstance(tid, dict):
+        h = tid.get("hash")
+        lt = tid.get("lt")
+        if h and lt:
+            return f"{lt}:{h}"
+        if h:
+            return str(h)
+        if lt:
+            return str(lt)
+    # Plain fields
+    if isinstance(tx.get("hash"), (str, bytes)):
+        return tx["hash"] if isinstance(tx["hash"], str) else tx["hash"].decode("utf-8", "ignore")
+    if "lt" in tx and not isinstance(tx.get("lt"), dict):
+        return str(tx.get("lt"))
+    # Fallback
+    return f"tx-{uuid.uuid4().hex[:12]}"
+
 # ======== Business logic ========
 async def find_incoming_with_comment(
     provider: TxProvider, address: str, comment: str,
@@ -314,15 +332,8 @@ async def find_incoming_with_comment(
         if tx_dt and tx_dt < since_dt:
             continue
 
-        tx_hash = (
-            tx.get("hash")
-            or tx.get("transaction_id")
-            or tx.get("lt")
-            or (tx.get("transaction_id", {}) or {}).get("hash")
-            or "unknown"
-        )
+        tx_id = _tx_id_str(tx)
 
-        # собрать сообщения из разных форматов
         msgs: List[Dict[str, Any]] = []
         for key in ["in_msg", "in_msg_desc", "inMessage", "inMessageDesc"]:
             if isinstance(tx.get(key), dict):
@@ -337,7 +348,7 @@ async def find_incoming_with_comment(
             cmt = _extract_comment_from_msg(msg).lower()
             amt = _extract_amount_from_msg(msg)
             if cmt == wanted and amt is not None and amt >= min_amount_ton:
-                return tx_hash, amt
+                return tx_id, amt
     return None
 
 # ======== Utils ========
@@ -430,22 +441,26 @@ async def verify_handler(m: types.Message, provider: TxProvider, pool: asyncpg.P
         await m.answer("Платёж не найден. Проверь комментарий, сумму и адрес. Если платил только что — подожди 1–2 минуты и попробуй ещё раз.")
         return
 
-    tx_hash, amount_ton = found
-    async with pool.acquire() as con:
-        await con.execute(
-            "UPDATE app_payments SET status='paid', tx_hash=$2, paid_at=now() WHERE id=$1",
-            row["id"], tx_hash
-        )
-        await con.execute(
-            "INSERT INTO app_users (user_id, scanner_enabled, updated_at) VALUES ($1, TRUE, now()) "
-            "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
-            m.from_user.id
-        )
+    tx_id, amount_ton = found
+    try:
+        async with pool.acquire() as con:
+            await con.execute(
+                "UPDATE app_payments SET status='paid', tx_hash=$2, paid_at=now() WHERE id=$1",
+                row["id"], str(tx_id)
+            )
+            await con.execute(
+                "INSERT INTO app_users (user_id, scanner_enabled, updated_at) VALUES ($1, TRUE, now()) "
+                "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
+                m.from_user.id
+            )
+    except Exception as e:
+        await m.answer(f"Оплата найдена ({amount_ton} TON), но возникла ошибка сохранения. Сообщи поддержку. Код: {e}")
+        return
 
     await m.answer(
         "Оплата подтверждена.\n"
         f"Сумма: {amount_ton} TON\n"
-        f"Tx: {tx_hash}\n\n"
+        f"Tx: {tx_id}\n\n"
         "Мониторинг лотов активирован. Команды: /scanner_settings, /scanner_off"
     )
 
@@ -464,13 +479,7 @@ async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg
     for tx in items:
         if shown >= 5:
             break
-        tx_hash = (
-            tx.get("hash")
-            or tx.get("transaction_id")
-            or tx.get("lt")
-            or (tx.get("transaction_id", {}) or {}).get("hash")
-            or "unknown"
-        )
+        tx_id = _tx_id_str(tx)
         utime = tx.get("utime") or tx.get("timestamp") or tx.get("now") or tx.get("created_at")
         when = "—"
         if utime is not None:
@@ -494,10 +503,10 @@ async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg
             cmt = _extract_comment_from_msg(msg)
             amt = _extract_amount_from_msg(msg)
             if cmt or amt is not None:
-                lines.append(f"• {when} | {tx_hash}\n  comment: {cmt or '—'}\n  amount: {amt if amt is not None else '—'} TON")
+                lines.append(f"• {when} | {tx_id}\n  comment: {cmt or '—'}\n  amount: {amt if amt is not None else '—'} TON")
                 found_any = True
         if not found_any:
-            lines.append(f"• {when} | {tx_hash}\n  (нет комм/суммы в доступных полях)")
+            lines.append(f"• {when} | {tx_id}\n  (нет комм/суммы в доступных полях)")
         shown += 1
 
     await m.answer("\n".join(lines))
@@ -509,25 +518,22 @@ async def debug_addr_handler(m: types.Message, provider: TxProvider, pool: async
         return
 
     lines: List[str] = [f"Исходный: {wallet}", "Проверка форм адреса:"]
-    # 1) Локальные формы — TonAPI
+    # TonAPI — локальные формы
     for v in normalize_for_tonapi_local(wallet):
         code, items = await provider.tonapi.fetch_tx(v, limit=1)
         lines.append(f"— TonAPI {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-
-    # 2) Конвертация через TonAPI и повтор — TonAPI
+    # TonAPI — конвертация и повтор
     forms = await provider.tonapi.convert_address(wallet)
     for key in ["bounceable", "non_bounceable", "raw"]:
         v = forms.get(key)
         if v:
             code, items = await provider.tonapi.fetch_tx(v, limit=1)
             lines.append(f"— TonAPI {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-
-    # 3) Локальные формы — TON Center
+    # TON Center — локальные формы
     for v in normalize_for_tonapi_local(wallet):
         code, items = await provider.toncenter.fetch_tx(v, limit=1)
         lines.append(f"— TONCENTER {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-
-    # 4) Конвертированные формы — TON Center
+    # TON Center — конвертированные формы
     for key in ["bounceable", "non_bounceable", "raw"]:
         v = forms.get(key) if forms else None
         if v:
