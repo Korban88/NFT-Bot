@@ -35,6 +35,9 @@ LISTINGS_FEED_URL = os.getenv("LISTINGS_FEED_URL", "").strip()
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "180"))
 
+# Админ для служебных команд
+ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "347552741"))
+
 # ======== Клавиатура ========
 def main_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -123,7 +126,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "NFT Бот: сканер выгодных лотов и витрина коллекции.\n"
         "Команды:\n"
         "/pay — оплата доступа\n"
-        "/scanner_on, /scanner_off, /scanner_settings\n"
+        "/scanner_on, /scanner_off, /scanner_settings, /scanner_reset\n"
         "/set_discount, /set_maxprice, /set_collections\n"
         "/scanner_test",
         reply_markup=main_kb()
@@ -231,7 +234,7 @@ def _item_caption(it: Dict[str, Any]) -> str:
     if price is not None:
         lines.append(f"Цена: {float(price):.3f} TON")
     if floor is not None:
-        lines.append(f"Floor: {float(floor):.3f} TON")
+        lines.append(f"Floor: {float(floor)::.3f} TON")
     if disc is not None:
         lines.append(f"Скидка: {float(disc):.1f}%")
     lines.append(url)
@@ -412,7 +415,7 @@ async def cb_settings(call: types.CallbackQuery):
         # если сообщение нельзя редактировать — отправим новое
         await call.message.answer(_settings_text(st), reply_markup=_settings_kb())
 
-    # Если нажали "Обновить" — сразу сделаем быстрый скан (до 3 новых лотов)
+    # Если нажали "Обновить" — быстрый скан (до 3 новых лотов)
     if action == "refresh":
         bot = call.message.bot
         await quick_scan_for_user(bot, call.from_user.id, pool, max_items=3)
@@ -479,6 +482,16 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     else:
         await m.answer(f"Отправлено лотов: {sent}")
 
+# ======== Служебная: сброс антидубликатов (админ) ========
+async def scanner_reset_handler(m: types.Message, pool: asyncpg.Pool):
+    if m.from_user.id != ADMIN_ID:
+        await m.answer("Команда доступна только администратору.")
+        return
+    async with (await get_pool()).acquire() as con:
+        cnt = await con.fetchval("SELECT COUNT(*) FROM app_found_deals")
+        await con.execute("TRUNCATE app_found_deals")
+    await m.answer(f"Сброшено записей: {cnt}. Антидубликаты очищены.")
+
 # ======== Регистрация ========
 def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: start_handler(m, pool), commands={"start"})
@@ -495,6 +508,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: set_maxprice_handler(m, pool), commands={"set_maxprice"})
     dp.register_message_handler(lambda m: set_collections_handler(m, pool), commands={"set_collections"})
     dp.register_message_handler(lambda m, b=bot: scanner_test_handler(m, b, pool), commands={"scanner_test"})
+    dp.register_message_handler(lambda m: scanner_reset_handler(m, pool), commands={"scanner_reset"})
 
     # reply-кнопки (пример)
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
