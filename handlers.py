@@ -19,7 +19,7 @@ from aiogram.types import (
 # ======== Config ========
 ENV_WALLET = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # TON
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.01"))  # TON (понижена для тестов)
 TON_DECIMALS = Decimal(10**9)
 
 # ======== Keyboards / Links ========
@@ -124,7 +124,7 @@ def friendly_to_raw(addr: str) -> Optional[str]:
     """
     try:
         b = _b64url_decode_padded(addr)
-        if len(b) < 34:  # ожидаем минимум tag(1)+wc(1)+hash(32)
+        if len(b) < 34:
             return None
         wc = int.from_bytes(b[1:2], "big", signed=True)
         hash_part = b[2:34]
@@ -163,7 +163,7 @@ class TonAPI:
         except Exception:
             return False
 
-    # --- NEW: server-side conversion via TonAPI ---
+    # --- Server-side conversion via TonAPI ---
     async def _convert_address(self, address: str) -> Dict[str, str]:
         """
         Возвращает формы адреса через TonAPI: bounceable/non_bounceable (b64url) и raw.
@@ -195,12 +195,10 @@ class TonAPI:
 
     async def list_recent(self, address: str, limit: int = 20) -> List[Dict[str, Any]]:
         # 1) Локальные формы (исходный + raw)
-        tried: List[str] = []
         for acc in normalize_for_tonapi_local(address):
             code, items = await self._fetch_tx(acc, limit)
             if items is not None:
                 return items
-            tried.append(f"{acc} (HTTP {code})")
 
         # 2) Серверная конвертация TonAPI и повтор (bounceable, non_bounceable, raw)
         forms = await self._convert_address(address)
@@ -210,7 +208,6 @@ class TonAPI:
                 code, items = await self._fetch_tx(acc, limit)
                 if items is not None:
                     return items
-                tried.append(f"{acc} (HTTP {code})")
 
         # 3) Ничего не нашли
         return []
@@ -435,7 +432,6 @@ async def debug_addr_handler(m: types.Message, tonapi: TonAPI, pool: asyncpg.Poo
         await m.answer("Адрес приёма не задан. Укажи его: /set_wallet <адрес TON>")
         return
 
-    # Покажем и локальные, и TonAPI-конвертированные формы
     lines = [f"Исходный: {wallet}", "Проверка форм адреса:"]
     checked: List[str] = []
 
