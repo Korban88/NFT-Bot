@@ -7,29 +7,31 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
-from zoneinfo import ZoneInfo  # локальная таймзона
+from zoneinfo import ZoneInfo
 
 import httpx
 import asyncpg
 from aiogram import Dispatcher, types, Bot
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
 
-# ======== Config ========
+# ======== Config (общие) ========
 ENV_WALLET = os.getenv("TON_WALLET_ADDRESS", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # optional
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
-MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))  # прод-минималка
-PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))       # TTL платежа в минутах
-
-# >>> ВСЁ ВРЕМЯ — ПО МОСКВЕ <<<
+MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))
+PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
 LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
-
 TON_DECIMALS = Decimal(10**9)
+
+# ======== Config (сканер) ========
+LISTINGS_FEED_URL = os.getenv("LISTINGS_FEED_URL", "").strip()  # URL JSON массива лотов
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))    # период фонового сканирования
+SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "180"))   # брать лоты не старше N минут
 
 # ======== Keyboards / Links ========
 def main_kb() -> ReplyKeyboardMarkup:
@@ -91,12 +93,35 @@ CREATE TABLE IF NOT EXISTS app_config (
 );
 """
 
+# Сканер: настройки пользователя
+CREATE_SCANNER_SETTINGS_SQL = """
+CREATE TABLE IF NOT EXISTS app_scanner_settings (
+    user_id BIGINT PRIMARY KEY,
+    min_discount NUMERIC(6,2) NOT NULL DEFAULT 25.0,    -- % минимум скидки
+    max_price_ton NUMERIC(20,9),                        -- максимум цена TON (NULL = нет лимита)
+    collections TEXT[],                                 -- массив slug/id коллекций (NULL = любые)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+# Сканер: отправленные айтемы, чтобы не дублировать
+CREATE_SCANNER_SENT_SQL = """
+CREATE TABLE IF NOT EXISTS app_scanner_sent (
+    user_id BIGINT NOT NULL,
+    item_id TEXT NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, item_id)
+);
+"""
+
 async def ensure_tables(pool: asyncpg.Pool):
     async with pool.acquire() as con:
         async with con.transaction():
             await con.execute(CREATE_APP_PAYMENTS_SQL)
             await con.execute(CREATE_APP_USERS_SQL)
             await con.execute(CREATE_APP_CONFIG_SQL)
+            await con.execute(CREATE_SCANNER_SETTINGS_SQL)
+            await con.execute(CREATE_SCANNER_SENT_SQL)
 
 async def upsert_user(pool: asyncpg.Pool, user_id: int):
     async with pool.acquire() as con:
@@ -147,7 +172,7 @@ def normalize_for_tonapi_local(addr: str) -> List[str]:
             variants.append(raw)
     return variants
 
-# ======== Providers ========
+# ======== Providers: TonAPI / TonCenter (для платежей) ========
 class TonAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -191,9 +216,6 @@ class TonAPI:
         return r.status_code, None
 
 class TonCenter:
-    """
-    Фолбэк-провайдер. https://toncenter.com/api/v2/  метод getTransactions (GET).
-    """
     def __init__(self, api_key: str):
         self.base = "https://toncenter.com/api/v2/"
         self.api_key = api_key
@@ -212,7 +234,7 @@ class TonCenter:
             return 200, []
         return 200, data.get("result") or []
 
-# ======== Unified access layer ========
+# ======== Unified tx provider ========
 class TxProvider:
     def __init__(self, tonapi: TonAPI, toncenter: TonCenter):
         self.tonapi = tonapi
@@ -242,7 +264,7 @@ class TxProvider:
                     return items
         return []
 
-# ======== Parsing/helpers ========
+# ======== Parsing helpers (tx) ========
 def _to_ton(nanotons: Any) -> Optional[Decimal]:
     try:
         return Decimal(str(nanotons)) / TON_DECIMALS
@@ -256,7 +278,7 @@ def _extract_comment_from_msg(msg: Dict[str, Any]) -> str:
     for path in [
         ("decoded_body", "text"),
         ("decoded", "body", "text"),
-        ("msg_data", "text"),   # TonCenter
+        ("msg_data", "text"),
         ("body", "text"),
     ]:
         cur: Any = msg
@@ -285,24 +307,19 @@ def _extract_amount_from_msg(msg: Dict[str, Any]) -> Optional[Decimal]:
     return None
 
 def _tx_id_str(tx: Dict[str, Any]) -> str:
-    # Нормализованный ID (строка) для TonAPI/TonCenter
     tid = tx.get("transaction_id")
     if isinstance(tid, dict):
-        h = tid.get("hash")
-        lt = tid.get("lt")
-        if h and lt:
-            return f"{lt}:{h}"
-        if h:
-            return str(h)
-        if lt:
-            return str(lt)
+        h = tid.get("hash"); lt = tid.get("lt")
+        if h and lt: return f"{lt}:{h}"
+        if h: return str(h)
+        if lt: return str(lt)
     if isinstance(tx.get("hash"), (str, bytes)):
         return tx["hash"] if isinstance(tx["hash"], str) else tx["hash"].decode("utf-8", "ignore")
     if "lt" in tx and not isinstance(tx.get("lt"), dict):
         return str(tx.get("lt"))
     return f"tx-{uuid.uuid4().hex[:12]}"
 
-# ---- Time helpers: всё в MSK ----
+# ---- Time helpers (MSK) ----
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -313,10 +330,9 @@ def _to_local(dt: datetime) -> datetime:
 
 def _fmt_local(dt: datetime) -> str:
     d = _to_local(dt)
-    # Пример: 2025-08-11 18:04:47 MSK
     return d.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# ======== Business logic ========
+# ======== Business logic: поиски платежей ========
 async def find_incoming_with_comment(
     provider: TxProvider, address: str, comment: str,
     min_amount_ton: Decimal, lookback_minutes: int = 360
@@ -358,7 +374,18 @@ async def find_incoming_with_comment(
                 return tx_id, amt
     return None
 
-# ======== Handlers ========
+# ======== Utils ========
+def gen_comment() -> str:
+    return f"pay-{uuid.uuid4().hex[:6]}"
+
+async def notify_admin(bot: Bot, text: str):
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text)
+        except Exception:
+            pass
+
+# ======== Handlers: платежи/старт ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await upsert_user(pool, m.from_user.id)
     wa = await get_wallet(pool)
@@ -367,11 +394,15 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "Доступные команды:\n"
         "/scanner_on — включить мониторинг лотов\n"
         "/scanner_off — выключить мониторинг\n"
-        "/scanner_settings — настройки фильтров\n"
+        "/scanner_settings — показать мои фильтры\n"
+        "/set_discount N — мин. скидка, %\n"
+        "/set_maxprice N — макс. цена, TON\n"
+        "/set_collections a,b,c — коллекции\n"
+        "/scanner_test — прогнать сканер разово\n"
         "/pay — ссылка на оплату (есть web‑кнопки)\n"
-        "/verify pay-xxxxxx — проверить оплату по комментарию (подставь свой)\n"
+        "/verify pay-xxxxxx — проверить оплату\n"
         "/payments — последние платежи\n"
-        "/debug_tx — последние транзакции (отладка)\n"
+        "/debug_tx — последние транзакции (оплата)\n"
         "/debug_addr — проверить формы адреса\n"
         "/set_wallet АДРЕС — сменить адрес приёма\n"
         "/health — проверить TonAPI\n\n"
@@ -515,6 +546,269 @@ async def payments_handler(m: types.Message, pool: asyncpg.Pool):
 
     await m.answer("\n".join(lines))
 
+# ======== Сканер: хранение/фильтры/уведомления ========
+async def get_or_create_scanner_settings(pool: asyncpg.Pool, user_id: int) -> Dict[str, Any]:
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT min_discount, max_price_ton, collections FROM app_scanner_settings WHERE user_id=$1", user_id)
+        if row:
+            return dict(row)
+        await con.execute(
+            "INSERT INTO app_scanner_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id
+        )
+        return {"min_discount": Decimal("25.0"), "max_price_ton": None, "collections": None}
+
+async def update_scanner_settings(pool: asyncpg.Pool, user_id: int, **kwargs):
+    fields = []
+    values = []
+    for k, v in kwargs.items():
+        fields.append(f"{k}=$%d" % (len(values)+1))
+        values.append(v)
+    if not fields:
+        return
+    q = "UPDATE app_scanner_settings SET " + ", ".join(fields) + ", updated_at=now() WHERE user_id=$%d" % (len(values)+1)
+    values.append(user_id)
+    async with pool.acquire() as con:
+        await con.execute(q, *values)
+
+async def mark_sent(pool: asyncpg.Pool, user_id: int, item_id: str) -> bool:
+    try:
+        async with pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO app_scanner_sent (user_id, item_id) VALUES ($1,$2)",
+                user_id, item_id
+            )
+        return True
+    except Exception:
+        return False  # уже отправляли
+
+def _item_discount(item: Dict[str, Any]) -> Optional[Decimal]:
+    if item.get("discount") is not None:
+        try:
+            return Decimal(str(item["discount"]))
+        except InvalidOperation:
+            pass
+    price = item.get("price_ton")
+    floor = item.get("floor_ton")
+    try:
+        if price is not None and floor is not None and float(floor) > 0:
+            return Decimal((float(floor) - float(price)) / float(floor) * 100.0)
+    except Exception:
+        pass
+    return None
+
+def _item_fresh_enough(item: Dict[str, Any]) -> bool:
+    ts = item.get("listed_at")
+    if not ts:
+        return True
+    try:
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        return (_now_utc() - dt) <= timedelta(minutes=SCAN_LOOKBACK_MIN)
+    except Exception:
+        return True
+
+def _fmt_item_caption(it: Dict[str, Any]) -> str:
+    name = it.get("name") or "NFT"
+    coll = it.get("collection") or "—"
+    price = it.get("price_ton")
+    floor = it.get("floor_ton")
+    disc = _item_discount(it)
+    url = it.get("url") or "—"
+    lines = [f"🔥 {name}", f"Коллекция: {coll}"]
+    if price is not None:
+        lines.append(f"Цена: {float(price):.3f} TON")
+    if floor is not None:
+        lines.append(f"Floor: {float(floor):.3f} TON")
+    if disc is not None:
+        lines.append(f"Скидка: {float(disc):.1f}%")
+    lines.append(url)
+    return "\n".join(lines)
+
+def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
+    if not _item_fresh_enough(it):
+        return False
+    disc = _item_discount(it)
+    if disc is None or Decimal(disc) < Decimal(st["min_discount"]):
+        return False
+    if st.get("max_price_ton") is not None:
+        try:
+            if Decimal(str(it.get("price_ton", "0"))) > Decimal(st["max_price_ton"]):
+                return False
+        except InvalidOperation:
+            return False
+    cols = st.get("collections")
+    if cols:
+        try:
+            cols = [c.strip().lower() for c in cols]
+            item_col = (it.get("collection") or "").strip().lower()
+            if item_col and item_col not in cols:
+                return False
+        except Exception:
+            pass
+    return True
+
+async def send_item_alert(bot: Bot, user_id: int, item: Dict[str, Any]):
+    image = item.get("image")
+    caption = _fmt_item_caption(item)
+    if image and image.startswith("http"):
+        try:
+            await bot.send_photo(user_id, photo=image, caption=caption)
+            return
+        except Exception:
+            pass
+    await bot.send_message(user_id, caption)
+
+# ======== Сканер: загрузка фида ========
+async def fetch_listings() -> List[Dict[str, Any]]:
+    if not LISTINGS_FEED_URL:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(LISTINGS_FEED_URL)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        # допускаем обёртку {"items":[...]}
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return data["items"]
+        return []
+    except Exception:
+        return []
+
+# ======== Сканер: фоновая задача ========
+async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
+    await asyncio.sleep(3)  # дать боту стартануть
+    while True:
+        try:
+            items = await fetch_listings()
+            if items:
+                async with pool.acquire() as con:
+                    users = await con.fetch("SELECT user_id FROM app_users WHERE scanner_enabled=TRUE")
+                for u in users:
+                    uid = u["user_id"]
+                    st = await get_or_create_scanner_settings(pool, uid)
+                    for it in items:
+                        # нормализуем id
+                        item_id = str(it.get("id") or f"{it.get('collection','')}-{it.get('name','')}-{it.get('url','')}")
+                        if not item_id:
+                            continue
+                        if not _item_matches(it, st):
+                            continue
+                        # антидубликат
+                        inserted = await mark_sent(pool, uid, item_id)
+                        if not inserted:
+                            continue
+                        await send_item_alert(bot, uid, it)
+            await asyncio.sleep(SCAN_INTERVAL_SEC)
+        except Exception:
+            # не падаем — следующая итерация
+            await asyncio.sleep(SCAN_INTERVAL_SEC)
+
+# ======== Handlers: сканер команды ========
+async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO app_users (user_id, scanner_enabled) VALUES ($1, TRUE) "
+            "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
+            m.from_user.id
+        )
+    await m.answer("Мониторинг включён. Уведомлю о выгодных лотах.", reply_markup=main_kb())
+
+async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE app_users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
+            m.from_user.id
+        )
+    await m.answer("Мониторинг выключен.", reply_markup=main_kb())
+
+async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
+    st = await get_or_create_scanner_settings(pool, m.from_user.id)
+    lines = [
+        "Текущие фильтры сканера:",
+        f"— Мин. скидка: {float(st['min_discount']):.1f}%",
+        f"— Макс. цена: {('нет' if st['max_price_ton'] is None else f'{float(st['max_price_ton']):.3f} TON')}",
+        f"— Коллекции: {', '.join(st['collections']) if st['collections'] else 'любой'}",
+        "",
+        "Команды настройки:",
+        "/set_discount N",
+        "/set_maxprice N",
+        "/set_collections col1,col2"
+    ]
+    await m.answer("\n".join(lines), reply_markup=main_kb())
+
+async def set_discount_handler(m: types.Message, pool: asyncpg.Pool):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /set_discount 25")
+        return
+    try:
+        val = Decimal(parts[1].strip())
+        if val < 0 or val > 100:
+            raise InvalidOperation
+    except Exception:
+        await m.answer("Нужно число от 0 до 100.")
+        return
+    await update_scanner_settings(pool, m.from_user.id, min_discount=val)
+    await m.answer(f"Мин. скидка обновлена: {float(val):.1f}%")
+
+async def set_maxprice_handler(m: types.Message, pool: asyncpg.Pool):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /set_maxprice 100")
+        return
+    txt = parts[1].strip().lower()
+    if txt in ("-", "none", "нет"):
+        await update_scanner_settings(pool, m.from_user.id, max_price_ton=None)
+        await m.answer("Макс. цена очищена (нет лимита).")
+        return
+    try:
+        val = Decimal(txt)
+        if val <= 0:
+            raise InvalidOperation
+    except Exception:
+        await m.answer("Нужно положительное число (TON) или 'none'.")
+        return
+    await update_scanner_settings(pool, m.from_user.id, max_price_ton=val)
+    await m.answer(f"Макс. цена обновлена: {float(val):.3f} TON")
+
+async def set_collections_handler(m: types.Message, pool: asyncpg.Pool):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /set_collections col1,col2  (пусто/none — любые)")
+        return
+    raw = parts[1].strip()
+    if raw.lower() in ("none", "любой", "любые", "-", ""):
+        await update_scanner_settings(pool, m.from_user.id, collections=None)
+        await m.answer("Список коллекций очищен: любые коллекции.")
+        return
+    cols = [c.strip() for c in raw.split(",") if c.strip()]
+    if not cols:
+        await update_scanner_settings(pool, m.from_user.id, collections=None)
+        await m.answer("Список коллекций очищен: любые коллекции.")
+        return
+    await update_scanner_settings(pool, m.from_user.id, collections=cols)
+    await m.answer(f"Коллекции обновлены: {', '.join(cols)}")
+
+async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
+    items = await fetch_listings()
+    if not items:
+        await m.answer("Фид пуст или недоступен (LISTINGS_FEED_URL).")
+        return
+    st = await get_or_create_scanner_settings(pool, m.from_user.id)
+    sent = 0
+    for it in items[:20]:  # ограничим 20 для теста
+        if _item_matches(it, st):
+            await send_item_alert(bot, m.from_user.id, it)
+            sent += 1
+    if sent == 0:
+        await m.answer("Подходящих лотов не найдено по текущим фильтрам.")
+    else:
+        await m.answer(f"Отправлено лотов: {sent}")
+
+# ======== Debug: платежные / адрес ========
 async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg.Pool):
     wallet = await get_wallet(pool)
     if not wallet:
@@ -536,7 +830,7 @@ async def debug_tx_handler(m: types.Message, provider: TxProvider, pool: asyncpg
         if utime is not None:
             try:
                 dt_utc = datetime.fromtimestamp(int(utime), tz=timezone.utc)
-                when = _fmt_local(dt_utc)  # показываем локально (MSK)
+                when = _fmt_local(dt_utc)
             except Exception:
                 when = "—"
 
@@ -570,22 +864,18 @@ async def debug_addr_handler(m: types.Message, provider: TxProvider, pool: async
         return
 
     lines: List[str] = [f"Исходный: {wallet}", "Проверка форм адреса:"]
-    # TonAPI — локальные формы
     for v in normalize_for_tonapi_local(wallet):
         code, items = await provider.tonapi.fetch_tx(v, limit=1)
         lines.append(f"— TonAPI {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-    # TonAPI — конвертация и повтор
     forms = await provider.tonapi.convert_address(wallet)
     for key in ["bounceable", "non_bounceable", "raw"]:
         v = forms.get(key)
         if v:
             code, items = await provider.tonapi.fetch_tx(v, limit=1)
             lines.append(f"— TonAPI {key}: {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-    # TON Center — локальные формы
     for v in normalize_for_tonapi_local(wallet):
         code, items = await provider.toncenter.fetch_tx(v, limit=1)
         lines.append(f"— TONCENTER {v} -> HTTP {code}, items={'yes' if items else 'no'}")
-    # TON Center — конвертированные формы
     for key in ["bounceable", "non_bounceable", "raw"]:
         v = forms.get(key) if forms else None
         if v:
@@ -629,32 +919,6 @@ async def profile_handler(m: types.Message, pool: asyncpg.Pool):
         txt.append("— пока пусто")
     await m.answer("\n".join(txt))
 
-async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
-    async with pool.acquire() as con:
-        await con.execute(
-            "INSERT INTO app_users (user_id, scanner_enabled) VALUES ($1, TRUE) "
-            "ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=TRUE, updated_at=now()",
-            m.from_user.id
-        )
-    await m.answer("Мониторинг включён. Уведомлю о выгодных лотах.", reply_markup=main_kb())
-
-async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
-    async with pool.acquire() as con:
-        await con.execute(
-            "UPDATE app_users SET scanner_enabled=FALSE, updated_at=now() WHERE user_id=$1",
-            m.from_user.id
-        )
-    await m.answer("Мониторинг выключен.", reply_markup=main_kb())
-
-async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
-    await m.answer(
-        "Настройки сканера (временно заглушка):\n"
-        "— Скидка: ≥ 20–30%\n"
-        "— Коллекции: выбранные\n"
-        "— Цена/время/редкость: фильтры активны",
-        reply_markup=main_kb()
-    )
-
 # ======== Router ========
 def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     tonapi = TonAPI(TONAPI_KEY)
@@ -663,7 +927,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
 
     loop = asyncio.get_event_loop()
     loop.create_task(ensure_tables(pool))
+    # фоновый сканер
+    loop.create_task(scanner_loop(bot, pool))
 
+    # общие/платёжные
     dp.register_message_handler(lambda m: start_handler(m, pool), commands={"start"})
     dp.register_message_handler(lambda m: health_handler(m, provider, pool), commands={"health"})
     dp.register_message_handler(lambda m: pay_handler(m, bot, pool), commands={"pay"})
@@ -673,9 +940,16 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: debug_addr_handler(m, provider, pool), commands={"debug_addr"})
     dp.register_message_handler(lambda m: set_wallet_handler(m, pool), commands={"set_wallet"})
     dp.register_message_handler(lambda m: profile_handler(m, pool), lambda m: m.text == "Мой профиль")
+
+    # сканер
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), commands={"scanner_on"})
     dp.register_message_handler(lambda m: scanner_off_handler(m, pool), commands={"scanner_off"})
     dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), commands={"scanner_settings"})
-    # Кнопки внизу
+    dp.register_message_handler(lambda m: set_discount_handler(m, pool), commands={"set_discount"})
+    dp.register_message_handler(lambda m: set_maxprice_handler(m, pool), commands={"set_maxprice"})
+    dp.register_message_handler(lambda m: set_collections_handler(m, pool), commands={"set_collections"})
+    dp.register_message_handler(lambda m, b=bot: scanner_test_handler(m, b, pool), commands={"scanner_test"})
+
+    # нижние кнопки
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
     dp.register_message_handler(lambda m: scanner_settings_handler(m, pool), lambda m: m.text == "О коллекции")
