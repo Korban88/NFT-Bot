@@ -234,7 +234,7 @@ def _item_caption(it: Dict[str, Any]) -> str:
     if price is not None:
         lines.append(f"Цена: {float(price):.3f} TON")
     if floor is not None:
-        lines.append(f"Floor: {float(floor):.3f} TON")  # <= фикс форматтера
+        lines.append(f"Floor: {float(floor):.3f} TON")
     if disc is not None:
         lines.append(f"Скидка: {float(disc):.1f}%")
     lines.append(url)
@@ -248,7 +248,7 @@ async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
     img = (it.get("image") or "").strip()
     if img:
         try:
-            await bot.send_photo(user_id, img, caption=caption, reply_markup=kb)  # кнопка и у фото
+            await bot.send_photo(user_id, img, caption=caption, reply_markup=kb)
             return
         except Exception:
             pass
@@ -280,7 +280,7 @@ async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_it
             break
 
     if sent == 0:
-        await bot.send_message(user_id, "Свежих подходящих лотов нет. Попробуй позже или ослабь фильтры.")
+        await bot.send_message(user_id, "Сейчас подходящих лотов нет.")
     return sent
 
 # ======== Сканер: загрузка фида ========
@@ -478,7 +478,7 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
             await send_item_alert(bot, m.from_user.id, it)
             sent += 1
     if sent == 0:
-        await m.answer("Подходящих лотов не найдено по текущим фильтрам.")
+        await m.answer("Сейчас подходящих лотов нет.")
     else:
         await m.answer(f"Отправлено лотов: {sent}")
 
