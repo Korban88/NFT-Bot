@@ -234,7 +234,7 @@ def _item_caption(it: Dict[str, Any]) -> str:
     if price is not None:
         lines.append(f"Цена: {float(price):.3f} TON")
     if floor is not None:
-        lines.append(f"Floor: {float(floor)::.3f} TON")
+        lines.append(f"Floor: {float(floor):.3f} TON")  # <= фикс форматтера
     if disc is not None:
         lines.append(f"Скидка: {float(disc):.1f}%")
     lines.append(url)
@@ -248,7 +248,7 @@ async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
     img = (it.get("image") or "").strip()
     if img:
         try:
-            await bot.send_photo(user_id, img, caption=caption)
+            await bot.send_photo(user_id, img, caption=caption, reply_markup=kb)  # кнопка и у фото
             return
         except Exception:
             pass
