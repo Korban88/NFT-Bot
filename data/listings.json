@@ -34,5 +34,14 @@
     "timestamp": 1754934000,
     "url": "https://example.com/flight/004",
     "image": "https://picsum.photos/seed/flight004/600/400"
+  },
+  {
+    "name": "FLIGHT #005",
+    "collection": "FLIGHT",
+    "price_ton": 7.0,
+    "floor_ton": 12.0,
+    "timestamp": 1893456000,
+    "url": "https://example.com/flight/005",
+    "image": "https://picsum.photos/seed/flight005/600/400"
   }
 ]
