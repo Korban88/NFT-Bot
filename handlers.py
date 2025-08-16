@@ -128,7 +128,7 @@ async def start_handler(m: types.Message, pool: asyncpg.Pool):
         "/pay — оплата доступа\n"
         "/scanner_on, /scanner_off, /scanner_settings, /scanner_reset\n"
         "/set_discount, /set_maxprice, /set_collections\n"
-        "/scanner_test",
+        "/scanner_test, /scanner_source, /scanner_ping",
         reply_markup=main_kb()
     )
 
@@ -482,6 +482,40 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     else:
         await m.answer(f"Отправлено лотов: {sent}")
 
+# ======== Диагностика фида ========
+async def scanner_source_handler(m: types.Message):
+    url = LISTINGS_FEED_URL or "— не задан —"
+    await m.answer(
+        "Источник фида:\n"
+        f"{url}\n\n"
+        f"Интервал скана: {SCAN_INTERVAL_SEC} сек\n"
+        f"Окно свежести: {SCAN_LOOKBACK_MIN} мин"
+    )
+
+async def scanner_ping_handler(m: types.Message):
+    url = LISTINGS_FEED_URL
+    if not url:
+        await m.answer("LISTINGS_FEED_URL не задан.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url)
+        if r.status_code != 200:
+            await m.answer(f"Ошибка загрузки фида: HTTP {r.status_code}")
+            return
+        data = r.json()
+        items = data if isinstance(data, list) else (data.get("items") or [])
+        n = len(items) if isinstance(items, list) else 0
+        names = []
+        if isinstance(items, list):
+            for it in items[:3]:
+                nm = (it.get("name") or it.get("title") or "—")
+                names.append(str(nm))
+        names_txt = ", ".join(names) if names else "—"
+        await m.answer(f"Фид OK. Элементов: {n}. Первые: {names_txt}")
+    except Exception as e:
+        await m.answer(f"Ошибка: не удалось прочитать фид ({type(e).__name__})")
+
 # ======== Служебная: сброс антидубликатов (админ) ========
 async def scanner_reset_handler(m: types.Message, pool: asyncpg.Pool):
     if m.from_user.id != ADMIN_ID:
@@ -509,6 +543,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, pool: asyncpg.Pool):
     dp.register_message_handler(lambda m: set_collections_handler(m, pool), commands={"set_collections"})
     dp.register_message_handler(lambda m, b=bot: scanner_test_handler(m, b, pool), commands={"scanner_test"})
     dp.register_message_handler(lambda m: scanner_reset_handler(m, pool), commands={"scanner_reset"})
+    dp.register_message_handler(scanner_source_handler, commands={"scanner_source"})
+    dp.register_message_handler(scanner_ping_handler, commands={"scanner_ping"})
 
     # reply-кнопки (пример)
     dp.register_message_handler(lambda m: scanner_on_handler(m, pool), lambda m: m.text == "Купить NFT")
