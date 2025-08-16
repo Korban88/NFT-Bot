@@ -15,7 +15,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.dispatcher.filters import Command
 
 from config import settings
 from db import (
@@ -30,12 +29,16 @@ PAYMENT_TTL_MIN = int(os.getenv("PAYMENT_TTL_MIN", "30"))
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
 TON_DECIMALS = Decimal(10**9)
 
+# Источник данных
+SOURCE_DRIVER = os.getenv("SOURCE_DRIVER", "json").strip().lower()  # json | tonapi
+LISTINGS_FEED_URL = os.getenv("LISTINGS_FEED_URL", "").strip()      # для json
+TON_COLLECTIONS = [c.strip() for c in os.getenv("TON_COLLECTIONS", "").split(",") if c.strip()]  # для tonapi
+
 # Сканер
-LISTINGS_FEED_URL = os.getenv("LISTINGS_FEED_URL", "").strip()
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "180"))
 
-# Админ для служебных команд
+# Админ
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "347552741"))
 
 # ======== Клавиатура ========
@@ -49,57 +52,6 @@ def main_kb() -> ReplyKeyboardMarkup:
 # ======== Утилиты ========
 def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
-
-# ======== TonAPI/TonCenter провайдеры транзакций (как было) ========
-class TonAPIProvider:
-    def __init__(self, api_key: str):
-        self.base = "https://tonapi.io/v2/blockchain"
-        self.api_key = api_key
-
-    def _headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-
-    async def convert(self, addr: str) -> Dict[str, str]:
-        try:
-            url = f"{self.base}/accounts/{addr}/parse"
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                r = await client.get(url, headers=self._headers())
-            if r.status_code != 200:
-                return {}
-            data = r.json() or {}
-            return {
-                "bounceable": (data.get("bounceable") or {}).get("b64url") or "",
-                "non_bounceable": (data.get("non_bounceable") or {}).get("b64url") or "",
-                "raw": data.get("raw") or "",
-            }
-        except Exception:
-            return {}
-
-    async def fetch_tx(self, account_id: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-        url = f"{self.base}/accounts/{account_id}/transactions?limit={min(limit, 100)}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers=self._headers())
-        if r.status_code == 200:
-            data = r.json() or {}
-            return r.status_code, (data.get("transactions", []) or data.get("items", []) or [])
-        return r.status_code, None
-
-class TonCenter:
-    def __init__(self, api_key: str):
-        self.base = "https://toncenter.com/api/v2/"
-        self.api_key = api_key
-
-    async def fetch_tx(self, address: str, limit: int) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-        params = {"address": address, "limit": min(limit, 100), "archival": "true"}
-        if self.api_key:
-            params["api_key"] = self.api_key
-        url = self.base + "getTransactions"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, params=params)
-        if r.status_code == 200:
-            data = r.json() or {}
-            return r.status_code, data.get("result")
-        return r.status_code, None
 
 # ======== Платежи (ссылки) ========
 def gen_comment() -> str:
@@ -120,7 +72,7 @@ def build_tonhub_link(address: str, amount_ton: Decimal, comment: str) -> str:
 
 MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))
 
-# ======== Команды общего назначения ========
+# ======== Общие команды ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer(
         "NFT Бот: сканер выгодных лотов и витрина коллекции.\n"
@@ -178,7 +130,7 @@ async def pay_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
         "После оплаты вернись и нажми «Проверить».")
     await m.answer(msg, parse_mode="Markdown", reply_markup=kb)
 
-# ======== Вспомогательное для лотов ========
+# ======== Лоты: расчёт и фильтры ========
 def _item_discount(it: Dict[str, Any]) -> Optional[float]:
     try:
         p = Decimal(str(it.get("price_ton")))
@@ -232,9 +184,15 @@ def _item_caption(it: Dict[str, Any]) -> str:
     url = it.get("url") or "—"
     lines = [f"🔥 {name}", f"Коллекция: {coll}"]
     if price is not None:
-        lines.append(f"Цена: {float(price):.3f} TON")
+        try:
+            lines.append(f"Цена: {float(price):.3f} TON")
+        except Exception:
+            lines.append(f"Цена: {price} TON")
     if floor is not None:
-        lines.append(f"Floor: {float(floor):.3f} TON")
+        try:
+            lines.append(f"Floor: {float(floor):.3f} TON")
+        except Exception:
+            lines.append(f"Floor: {floor} TON")
     if disc is not None:
         lines.append(f"Скидка: {float(disc):.1f}%")
     lines.append(url)
@@ -254,7 +212,75 @@ async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
             pass
     await bot.send_message(user_id, caption, reply_markup=kb)
 
-# ======== Быстрый скан по кнопке «Обновить» ========
+# ======== Источники данных ========
+async def _fetch_from_json_feed() -> List[Dict[str, Any]]:
+    if not LISTINGS_FEED_URL:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(LISTINGS_FEED_URL)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return data["items"]
+        return []
+    except Exception:
+        return []
+
+async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
+    """
+    Подтягиваем свежие NFT по указанным коллекциям через TonAPI.
+    Цена/floor не всегда доступны — карточки всё равно показываем.
+    """
+    if not TON_COLLECTIONS:
+        return []
+    headers = {}
+    if getattr(settings, "TONAPI_KEY", None):
+        headers["Authorization"] = f"Bearer {settings.TONAPI_KEY}"
+
+    out: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+            for coll_addr in TON_COLLECTIONS:
+                url = f"https://tonapi.io/v2/nfts/collections/{coll_addr}/items?limit=20&offset=0"
+                r = await client.get(url)
+                if r.status_code != 200:
+                    continue
+                data = r.json() or {}
+                items = data.get("nft_items") or data.get("items") or []
+                now_ts = int(_now_utc().timestamp())
+                for it in items:
+                    addr = it.get("address") or ""
+                    meta = (it.get("metadata") or {})
+                    name = meta.get("name") or addr
+                    previews = it.get("previews") or []
+                    image = None
+                    if isinstance(previews, list) and previews:
+                        image = previews[-1].get("url") or previews[0].get("url")
+                    item_url = f"https://getgems.io/nft/{addr}" if addr else "—"
+
+                    out.append({
+                        "name": name,
+                        "collection": coll_addr,
+                        "price_ton": None,         # неизвестно
+                        "floor_ton": None,         # неизвестно
+                        "timestamp": now_ts,
+                        "url": item_url,
+                        "image": image,
+                    })
+        return out
+    except Exception:
+        return []
+
+async def fetch_listings() -> List[Dict[str, Any]]:
+    if SOURCE_DRIVER == "tonapi":
+        return await _fetch_from_tonapi()
+    return await _fetch_from_json_feed()
+
+# ======== Быстрый скан ========
 async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_items: int = 3) -> int:
     items = await fetch_listings()
     if not items:
@@ -283,28 +309,7 @@ async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_it
         await bot.send_message(user_id, "Сейчас подходящих лотов нет.")
     return sent
 
-# ======== Сканер: загрузка фида ========
-async def fetch_listings() -> List[Dict[str, Any]]:
-    """Элемент:
-    {"name":"...","collection":"FLIGHT","price_ton":8.5,"floor_ton":12.0,"timestamp":1723380000,"url":"https://...","image":"https://..."}
-    """
-    if not LISTINGS_FEED_URL:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(LISTINGS_FEED_URL)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and isinstance(data.get("items"), list):
-            return data["items"]
-        return []
-    except Exception:
-        return []
-
-# ======== Сканер: фоновая задача ========
+# ======== Фоновая задача ========
 async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
     await asyncio.sleep(3)
     while True:
@@ -336,14 +341,16 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
         except Exception:
             await asyncio.sleep(SCAN_INTERVAL_SEC)
 
-# ======== Кнопочное меню настроек ========
+# ======== Настройки сканера ========
 def _settings_text(st: Dict[str, Any]) -> str:
     min_disc = float(st["min_discount"])
     max_price = st["max_price_ton"]
     cols = st["collections"]
     max_price_text = "нет" if max_price is None else f"{float(max_price):.3f} TON"
     cols_text = "любой" if not cols else ", ".join(cols)
+    src = "TonAPI" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
     return (
+        f"Источник: {src}\n\n"
         "Текущие фильтры сканера:\n"
         f"— Мин. скидка: {min_disc:.1f}%\n"
         f"— Макс. цена: {max_price_text}\n"
@@ -373,7 +380,6 @@ async def scanner_settings_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer(_settings_text(st), reply_markup=_settings_kb())
 
 async def _apply_cfg_action(user_id: int, action: str):
-    # action: "disc:+5" | "disc:-5" | "max:10" | "max:none" | "cols:FLIGHT" | "cols:none" | "refresh"
     pool = await get_pool()
     key, _, val = action.partition(":")
     if key == "disc":
@@ -395,7 +401,7 @@ async def _apply_cfg_action(user_id: int, action: str):
             await update_scanner_settings(pool, user_id, collections=None)
         else:
             await update_scanner_settings(pool, user_id, collections=[val])
-    # refresh — ничего не меняем
+    # refresh — без изменений
 
 async def cb_settings(call: types.CallbackQuery):
     try:
@@ -408,14 +414,11 @@ async def cb_settings(call: types.CallbackQuery):
     pool = await get_pool()
     st = await get_or_create_scanner_settings(pool, call.from_user.id)
 
-    # Обновим текст настроек
     try:
         await call.message.edit_text(_settings_text(st), reply_markup=_settings_kb())
     except Exception:
-        # если сообщение нельзя редактировать — отправим новое
         await call.message.answer(_settings_text(st), reply_markup=_settings_kb())
 
-    # Если нажали "Обновить" — быстрый скан (до 3 новых лотов)
     if action == "refresh":
         bot = call.message.bot
         await quick_scan_for_user(bot, call.from_user.id, pool, max_items=3)
@@ -469,7 +472,7 @@ async def set_collections_handler(m: types.Message, pool: asyncpg.Pool):
 async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     items = await fetch_listings()
     if not items:
-        await m.answer("Фид пуст или недоступен (LISTINGS_FEED_URL).")
+        await m.answer("Фид пуст или недоступен (настрой источник).")
         return
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
     sent = 0
@@ -482,41 +485,32 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
     else:
         await m.answer(f"Отправлено лотов: {sent}")
 
-# ======== Диагностика фида ========
+# ======== Диагностика ========
 async def scanner_source_handler(m: types.Message):
-    url = LISTINGS_FEED_URL or "— не задан —"
+    if SOURCE_DRIVER == "tonapi":
+        src = f"TonAPI (коллекций: {len(TON_COLLECTIONS)})"
+    else:
+        src = LISTINGS_FEED_URL or "— не задан —"
     await m.answer(
         "Источник фида:\n"
-        f"{url}\n\n"
+        f"{src}\n\n"
         f"Интервал скана: {SCAN_INTERVAL_SEC} сек\n"
         f"Окно свежести: {SCAN_LOOKBACK_MIN} мин"
     )
 
 async def scanner_ping_handler(m: types.Message):
-    url = LISTINGS_FEED_URL
-    if not url:
-        await m.answer("LISTINGS_FEED_URL не задан.")
-        return
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url)
-        if r.status_code != 200:
-            await m.answer(f"Ошибка загрузки фида: HTTP {r.status_code}")
-            return
-        data = r.json()
-        items = data if isinstance(data, list) else (data.get("items") or [])
-        n = len(items) if isinstance(items, list) else 0
-        names = []
-        if isinstance(items, list):
-            for it in items[:3]:
-                nm = (it.get("name") or it.get("title") or "—")
-                names.append(str(nm))
-        names_txt = ", ".join(names) if names else "—"
-        await m.answer(f"Фид OK. Элементов: {n}. Первые: {names_txt}")
+        if SOURCE_DRIVER == "tonapi":
+            items = await _fetch_from_tonapi()
+        else:
+            items = await _fetch_from_json_feed()
+        n = len(items)
+        names = [str((it.get("name") or "—")) for it in items[:3]]
+        await m.answer(f"Источник OK. Элементов: {n}. Первые: {', '.join(names) if names else '—'}")
     except Exception as e:
-        await m.answer(f"Ошибка: не удалось прочитать фид ({type(e).__name__})")
+        await m.answer(f"Ошибка пинга источника: {type(e).__name__}")
 
-# ======== Служебная: сброс антидубликатов (админ) ========
+# ======== Сброс антидубликатов (админ) ========
 async def scanner_reset_handler(m: types.Message, pool: asyncpg.Pool):
     if m.from_user.id != ADMIN_ID:
         await m.answer("Команда доступна только администратору.")
