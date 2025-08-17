@@ -37,6 +37,9 @@ SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "1440"))  # 24h
 SCAN_PUSH_LIMIT = int(os.getenv("SCAN_PUSH_LIMIT", "5"))
 SCAN_COLD_START_SKIP_SEND = (os.getenv("SCAN_COLD_START_SKIP_SEND", "true").lower() == "true")
 
+# новая настройка метрики «скидки»: median или p75 (процентиль 75)
+DISCOUNT_BASELINE = os.getenv("DISCOUNT_BASELINE", "median").strip().lower()
+
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "347552741"))
 
 # внутренний флаг «первый проход»
@@ -142,21 +145,36 @@ def _safe_decimal(x) -> Optional[Decimal]:
 def _to_ton(value: Optional[Decimal]) -> Optional[float]:
     if value is None:
         return None
-    # Если значение похоже на нанотоны (большое), конвертируем
     try:
         v = Decimal(value)
-        if v > 1_000_000:  # эвристика
+        # если очень большое — это нанотоны
+        if v > 1_000_000:
             return float(v / TON_DECIMALS)
         return float(v)
     except Exception:
         return None
 
-def _item_discount(it: Dict[str, Any]) -> Optional[float]:
-    p = _safe_decimal(it.get("price_ton"))
-    f = _safe_decimal(it.get("floor_ton"))
-    if p and f and p > 0 and f > 0:
-        return float((f - p) / f * 100)
+def _pct(a: float, b: float) -> Optional[float]:
+    if b and b > 0:
+        return float((b - a) / b * 100.0)
     return None
+
+def _median(values: List[float]) -> float:
+    n = len(values)
+    if n == 0:
+        return 0.0
+    arr = sorted(values)
+    mid = n // 2
+    if n % 2:
+        return arr[mid]
+    return (arr[mid - 1] + arr[mid]) / 2.0
+
+def _p75(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    arr = sorted(values)
+    idx = int(0.75 * (len(arr) - 1))
+    return arr[idx]
 
 def _deal_id(it: Dict[str, Any]) -> str:
     raw = f"{it.get('collection','')}|{it.get('nft_address','')}|{it.get('price_ton','')}"
@@ -172,14 +190,17 @@ def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
                 return False
         except Exception:
             pass
-    # скидка — ВАЖНО: если min_discount == 0 → НЕ фильтруем по скидке вовсе
-    disc = it.get("discount")
+
+    # скидка: если min_discount==0 — не фильтруем
     try:
         min_disc = float(st.get("min_discount") or 0.0)
     except Exception:
         min_disc = 0.0
-    if min_disc > 0.0 and disc is not None and float(disc) < min_disc:
-        return False
+    disc = it.get("discount")
+    if min_disc > 0.0:
+        if disc is None or float(disc) < min_disc:
+            return False
+
     # цена
     maxp = st.get("max_price_ton")
     if maxp is not None:
@@ -189,11 +210,13 @@ def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
                 return False
         except Exception:
             return False
-    # коллекции
+
+    # коллекции (если задан список адресов)
     cols = st.get("collections") or []
     if cols:
         col = (it.get("collection") or "").strip()
         return any(col.lower() == c.lower().strip() for c in cols)
+
     return True
 
 def _item_caption(it: Dict[str, Any]) -> str:
@@ -201,8 +224,8 @@ def _item_caption(it: Dict[str, Any]) -> str:
     coll = it.get("collection") or "—"
     price = it.get("price_ton")
     floor = it.get("floor_ton")
-    disc = it.get("discount")
-    url = it.get("url") or "—"
+    median = it.get("median_ton")
+    disc = it.get("discount")  # к медиане
     lines = [f"🔥 {name}", f"Коллекция: {coll}"]
     if price is not None:
         try:
@@ -214,17 +237,21 @@ def _item_caption(it: Dict[str, Any]) -> str:
             lines.append(f"Floor: {float(floor):.3f} TON")
         except Exception:
             lines.append(f"Floor: {floor} TON")
+    if median is not None:
+        try:
+            lines.append(f"Медиана: {float(median):.3f} TON")
+        except Exception:
+            pass
     if disc is not None:
-        lines.append(f"Скидка: {float(disc):.1f}%")
-    lines.append(url)
+        lines.append(f"Скидка к медиане: {float(disc):.1f}%")
     return "\n".join(lines)
 
 async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
     kb = InlineKeyboardMarkup(row_width=2)
     if it.get("url"):
-        kb.insert(InlineKeyboardButton("Открыть лот", url=it["url"]))
+        kb.insert(InlineKeyboardButton("Tonviewer", url=it["url"]))
     if it.get("gg_url"):
-        kb.insert(InlineKeyboardButton("Открыть на Getgems", url=it["gg_url"]))
+        kb.insert(InlineKeyboardButton("Getgems", url=it["gg_url"]))
     caption = _item_caption(it)
     img = (it.get("image") or "").strip()
     if img:
@@ -235,7 +262,7 @@ async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
             pass
     await bot.send_message(user_id, caption, reply_markup=kb)
 
-# ======== Источники данных ========
+# ======== Источники ========
 def _tonviewer_url(addr: str) -> str:
     return f"https://tonviewer.com/{addr}"
 
@@ -254,14 +281,13 @@ def _parse_iso_ts(s: Optional[str]) -> Optional[int]:
 def _extract_sale_price_ton(sale: Dict[str, Any]) -> Optional[float]:
     """
     Нормализуем цену из TonAPI:
-    - sale["price"] может быть числом/строкой в нанотонах
-    - либо объектом: {"value": "...", "token_name": "TON"} или {"amount":{"value":"..."}}
+    - может быть числом/строкой в нанотонах
+    - либо объект: {"value":"..."}, {"amount":{"value":"..."}}, etc.
     """
     if sale is None:
         return None
     cand = None
 
-    # прямые варианты
     for key in ("price", "full_price", "amount"):
         val = sale.get(key)
         if isinstance(val, (int, float, str, Decimal)):
@@ -269,13 +295,11 @@ def _extract_sale_price_ton(sale: Dict[str, Any]) -> Optional[float]:
             if cand is not None:
                 break
         if isinstance(val, dict):
-            # amount: {"value":"..."}  |  price: {"value":"...","token_name":"TON"}
-            inner = val.get("value") or val.get("amount") or val.get("nano") or None
+            inner = val.get("value") or val.get("amount") or val.get("nano")
             cand = _safe_decimal(inner)
             if cand is not None:
                 break
 
-    # последний шанс — прямое поле "value"
     if cand is None:
         cand = _safe_decimal(sale.get("value"))
 
@@ -299,7 +323,7 @@ async def _fetch_from_json_feed() -> List[Dict[str, Any]]:
         return []
 
 async def _fetch_collection_items(client: httpx.AsyncClient, coll_addr: str) -> List[Dict[str, Any]]:
-    """Подгружаем предметы коллекции, возвращаем только те, что в продаже; делаем 1 ретрай при 429."""
+    """Подгружаем предметы коллекции, возвращаем только те, что в продаже; 1 ретрай при 429."""
     url = f"https://tonapi.io/v2/nfts/collections/{coll_addr}/items?limit=50&offset=0"
     for attempt in (0, 1):
         r = await client.get(url)
@@ -307,7 +331,7 @@ async def _fetch_collection_items(client: httpx.AsyncClient, coll_addr: str) -> 
             data = r.json() or {}
             return data.get("nft_items") or data.get("items") or []
         if r.status_code == 429 and attempt == 0:
-            await asyncio.sleep(0.9)  # короткий backoff
+            await asyncio.sleep(0.9)
             continue
         return []
     return []
@@ -315,8 +339,8 @@ async def _fetch_collection_items(client: httpx.AsyncClient, coll_addr: str) -> 
 async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     """
     Берём ТОЛЬКО NFT, которые в продаже (есть sale).
-    Ссылка всегда tonviewer; кнопку Getgems добавляем, если marketplace = getgems.
-    После fetch считаем локальный floor по каждой коллекции и discount.
+    Линки: Tonviewer (всегда), + кнопка Getgems если маркетплейс = getgems.
+    Считаем по коллекциям: floor и baseline (медиана/п75), скидка = (baseline - price)/baseline * 100.
     """
     if not TON_COLLECTIONS:
         return []
@@ -327,7 +351,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            total_cap = 160  # общий колпак на проход
+            total_cap = 200  # общий колпак
             for coll_addr in TON_COLLECTIONS:
                 if total_cap <= 0:
                     break
@@ -335,16 +359,14 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                 for it in items:
                     sale = it.get("sale") or it.get("marketplace")
                     if not isinstance(sale, dict):
-                        continue  # только то, что реально выставлено
+                        continue  # только выставленные
 
                     addr = it.get("address") or ""
                     if not addr:
                         continue
 
-                    # цена
                     price_ton = _extract_sale_price_ton(sale)
 
-                    # превью
                     img = None
                     previews = it.get("previews") or []
                     if isinstance(previews, list) and previews:
@@ -352,11 +374,9 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
 
                     name = (it.get("metadata") or {}).get("name") or addr
 
-                    # время публикации продажи
                     ts = _parse_iso_ts(sale.get("created_at")) or _parse_iso_ts(it.get("created_at")) \
                          or int(_now_utc().timestamp())
 
-                    # ссылки
                     url_view = _tonviewer_url(addr)
                     gg_url = None
                     market_name = (sale.get("marketplace") or {}).get("name") if isinstance(sale.get("marketplace"), dict) else sale.get("market") or sale.get("name")
@@ -368,8 +388,9 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                         "collection": coll_addr,
                         "nft_address": addr,
                         "price_ton": price_ton,
-                        "floor_ton": None,   # заполним ниже
-                        "discount": None,    # заполним ниже
+                        "floor_ton": None,    # заполним ниже
+                        "median_ton": None,   # заполним ниже
+                        "discount": None,     # заполним ниже (к медиане/п75)
                         "timestamp": ts,
                         "url": url_view,
                         "gg_url": gg_url,
@@ -381,7 +402,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-    # Локальный floor по коллекции: минимальная цена >0
+    # Сводные цены по коллекциям
     by_coll: Dict[str, List[float]] = {}
     for x in rows:
         p = _safe_decimal(x.get("price_ton"))
@@ -389,14 +410,28 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
             by_coll.setdefault(x["collection"], []).append(float(p))
 
     floors: Dict[str, float] = {c: min(v) for c, v in by_coll.items() if v}
+    baselines: Dict[str, float] = {}
+    for c, prices in by_coll.items():
+        if not prices:
+            continue
+        if DISCOUNT_BASELINE == "p75":
+            baselines[c] = _p75(prices)
+        else:
+            baselines[c] = _median(prices)
 
+    # Проставляем floor / baseline / discount
     for x in rows:
-        floor = floors.get(x["collection"])
+        coll = x["collection"]
+        floor = floors.get(coll)
+        base = baselines.get(coll)
         if floor:
             x["floor_ton"] = floor
+        if base:
+            x["median_ton"] = base
+        price = x.get("price_ton")
+        if price and base and base > 0:
             try:
-                if x.get("price_ton") and floor > 0:
-                    x["discount"] = float((floor - float(x["price_ton"])) / floor * 100.0)
+                x["discount"] = _pct(float(price), float(base))
             except Exception:
                 pass
 
@@ -409,7 +444,7 @@ async def fetch_listings() -> List[Dict[str, Any]]:
 
 # ======== Отбор и сортировка ========
 def _rank_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # сортируем по убыванию скидки, при равной скидке — дешевле вверх
+    # по убыванию скидки (к медиане), потом по цене
     def key(it):
         disc = it.get("discount")
         disc_key = -9999.0 if disc is None else float(disc)
@@ -493,9 +528,10 @@ def _settings_text(st: Dict[str, Any]) -> str:
     cols = st["collections"]
     max_price_text = "нет" if max_price is None else f"{float(max_price):.3f} TON"
     cols_text = "любой" if not cols else ", ".join(cols)
-    src = "TonAPI (в продаже, сорт. по скидке, tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
+    src = "TonAPI (в продаже, tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
     return (
         f"Источник: {src}\n"
+        f"Метрика скидки: {'медиана' if DISCOUNT_BASELINE == 'median' else 'p75'} (по коллекции)\n"
         f"Лимит рассылки за цикл: {SCAN_PUSH_LIMIT}\n"
         f"Холодный старт: {'skip' if SCAN_COLD_START_SKIP_SEND else 'send'}\n\n"
         "Текущие фильтры сканера:\n"
@@ -578,7 +614,7 @@ async def scanner_on_handler(m: types.Message, pool: asyncpg.Pool):
 
 async def scanner_off_handler(m: types.Message, pool: asyncpg.Pool):
     await set_scanner_enabled(pool, m.from_user.id, False)
-    await m.answer("Мониторинг выключен.", reply_markup=main_kb())
+    await m.answer("Мониторинг выключен.", reply_markup=main_kб())
 
 async def set_discount_handler(m: types.Message, pool: asyncpg.Pool):
     parts = (m.text or "").split(maxsplit=1)
@@ -636,12 +672,13 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
 # ======== Диагностика ========
 async def scanner_source_handler(m: types.Message):
     if SOURCE_DRIVER == "tonapi":
-        src = f"TonAPI (в продаже, сорт. по скидке, tonviewer) / коллекций: {len(TON_COLLECTIONS)} / лимит: {SCAN_PUSH_LIMIT}"
+        src = f"TonAPI (в продаже, tonviewer) / коллекций: {len(TON_COLLECTIONS)} / лимит: {SCAN_PUSH_LIMIT}"
     else:
         src = LISTINGS_FEED_URL or "— не задан —"
     await m.answer(
         "Источник фида:\n"
         f"{src}\n\n"
+        f"Метрика скидки: {'медиана' if DISCOUNT_BASELINE == 'median' else 'p75'} (по коллекции)\n"
         f"Интервал скана: {SCAN_INTERVAL_SEC} сек\n"
         f"Окно свежести: {SCAN_LOOKBACK_MIN} мин\n"
         f"Холодный старт: {'skip' if SCAN_COLD_START_SKIP_SEND else 'send'}"
