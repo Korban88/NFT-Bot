@@ -9,6 +9,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from aiogram.utils.exceptions import MessageNotModified
 
 from db import (
     get_or_create_scanner_settings,  # (user_id)
@@ -153,46 +154,66 @@ async def cb_settings(call: types.CallbackQuery):
     st = await _ensure_user_settings(user_id)
     data = call.data or ""
 
+    changed = False
+
     try:
         if data.startswith("min_disc:"):
             delta = int(data.split(":", 1)[1])
-            cur = int(st.get("min_discount_pct") or 0)
-            cur = max(0, min(90, cur + delta))
-            st["min_discount_pct"] = cur
-            await update_scanner_settings(user_id, min_discount=cur)
+            cur_old = int(st.get("min_discount_pct") or st.get("min_discount") or 0)
+            new = max(0, min(90, cur_old + delta))
+            if new != cur_old:
+                st["min_discount_pct"] = new
+                changed = True
+                await update_scanner_settings(user_id, min_discount=new)
 
         elif data.startswith("min_price:"):
             delta = Decimal(data.split(":", 1)[1])
             cur_raw = st.get("min_price_ton")
-            cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
-            cur = max(Decimal("0"), cur + delta)
-            st["min_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, min_price_ton=str(cur))
+            cur_old = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
+            new = max(Decimal("0"), cur_old + delta)
+            if new != cur_old:
+                st["min_price_ton"] = str(new)
+                changed = True
+                await update_scanner_settings(user_id, min_price_ton=str(new))
 
         elif data.startswith("max_price:"):
             delta = Decimal(data.split(":", 1)[1])
             cur_raw = st.get("max_price_ton")
-            cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
-            cur = max(Decimal("0"), cur + delta)
-            st["max_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, max_price_ton=str(cur))
+            cur_old = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
+            new = max(Decimal("0"), cur_old + delta)
+            if new != cur_old:
+                st["max_price_ton"] = str(new)
+                changed = True
+                await update_scanner_settings(user_id, max_price_ton=str(new))
 
         elif data.startswith("poll:"):
             delta = int(data.split(":", 1)[1])
-            cur = int(st.get("poll_seconds") or 60)
-            cur = max(10, min(3600, cur + delta))
-            st["poll_seconds"] = cur
-            await update_scanner_settings(user_id, poll_seconds=cur)
+            cur_old = int(st.get("poll_seconds") or 60)
+            new = max(10, min(3600, cur_old + delta))
+            if new != cur_old:
+                st["poll_seconds"] = new
+                changed = True
+                await update_scanner_settings(user_id, poll_seconds=new)
 
         elif data == "cols:clear":
-            st["collections"] = []
-            await update_scanner_settings(user_id, collections=[])
+            if (st.get("collections") or []) != []:
+                st["collections"] = []
+                changed = True
+                await update_scanner_settings(user_id, collections=[])
+
+        if not changed:
+            await call.answer("Без изменений")
+            return
 
         await call.answer("Обновлено")
-        await call.message.edit_text(
-            "🛠 Настройки сканера обновлены:\n" + _format_scanner_settings(st),
-            reply_markup=call.message.reply_markup,
-        )
+
+        new_text = "🛠 Настройки сканера обновлены:\n" + _format_scanner_settings(st)
+        try:
+            await call.message.edit_text(new_text, reply_markup=call.message.reply_markup)
+        except MessageNotModified:
+            # На всякий случай проглатываем, если Telegram всё же решит, что текст/markup идентичны
+            pass
+
     except InvalidOperation:
         await call.answer("Некорректное число", show_alert=True)
 
