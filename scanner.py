@@ -123,14 +123,12 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                     continue
                 data = r.json()
                 items = []
-
                 candidates = (
                     data.get("orders") or
                     data.get("items") or
                     data.get("nft_items") or
                     []
                 )
-
                 for it in candidates:
                     price_ton = (
                         it.get("price_ton")
@@ -141,7 +139,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                         price_ton = float(price_ton) if price_ton is not None else None
                     except Exception:
                         price_ton = None
-
                     deal = {
                         "id": it.get("id") or it.get("order_id") or it.get("nft_item_id") or it.get("address"),
                         "nft_address": it.get("nft_address") or it.get("address"),
@@ -158,7 +155,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                         "url": it.get("url") or it.get("link"),
                     }
                     items.append(deal)
-
                 if items:
                     return items
             except Exception:
@@ -173,13 +169,11 @@ async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
                 continue
         except Exception:
             pass
-
         msg = _format_deal_msg(d)
         try:
             await bot.send_message(user_id, msg, disable_web_page_preview=False)
         except Exception as e:
             logger.warning(f"Не удалось отправить сообщение {user_id}: {e}")
-
         try:
             await mark_deal_seen({
                 "deal_id": deal_hash,
@@ -199,35 +193,25 @@ async def scanner_tick(bot: Bot):
     except Exception as e:
         logger.warning(f"get_scanner_users() failed: {e}")
         users = []
-
     if not users:
         return
-
     try:
         all_deals = await _fetch_from_tonapi()
     except Exception as e:
         logger.warning(f"TonAPI fetch failed: {e}")
         all_deals = []
-
     for u in users:
         user_id = _safe_user_id(u)
         if not user_id:
             continue
-
         try:
             st = await get_or_create_scanner_settings(user_id)
         except Exception as e:
             logger.warning(f"get_or_create_scanner_settings({user_id}) failed: {e}")
             continue
-
-        if not st.get("enabled") and not st.get("scanner_enabled"):
-            # На случай, если храним только в app_users, а не в settings
-            continue
-
         filtered = [d for d in all_deals if _passes_filters(d, st)]
         if not filtered:
             continue
-
         await _notify_user(bot, user_id, filtered)
 
 async def scanner_loop():
@@ -243,8 +227,7 @@ async def scanner_loop():
                 if not uid:
                     continue
                 st = await get_or_create_scanner_settings(uid)
-                if st.get("enabled") or st.get("scanner_enabled"):
-                    mins.append(int(st.get("poll_seconds") or 60))
+                mins.append(int(st.get("poll_seconds") or 60))
             if mins:
                 return max(10, min(mins))
         except Exception:
@@ -252,16 +235,13 @@ async def scanner_loop():
         return DEFAULT_TICK_SECONDS
 
     sleep_seconds = await _calc_sleep_default()
-
     while True:
         try:
             await scanner_tick(bot)
         except Exception as e:
             logger.exception(f"scanner_tick crashed: {e}")
-
         try:
             sleep_seconds = await _calc_sleep_default()
         except Exception:
             pass
-
         await asyncio.sleep(sleep_seconds)
