@@ -7,66 +7,71 @@ logger = logging.getLogger("nftbot")
 TONAPI_KEY = os.getenv("TONAPI_KEY")
 HEADERS = {"Authorization": f"Bearer {TONAPI_KEY}"} if TONAPI_KEY else {}
 
-MIN_DISCOUNT = float(os.getenv("MIN_DISCOUNT", 20.0))  # %
-MAX_PRICE_TON = os.getenv("MAX_PRICE_TON")
-MAX_PRICE_TON = float(MAX_PRICE_TON) if MAX_PRICE_TON not in [None, "", "None"] else None
-
-# список коллекций из переменных окружения
-COLLECTIONS = os.getenv("NFT_COLLECTIONS", "")
-COLLECTIONS = [c.strip() for c in COLLECTIONS.split(",") if c.strip()]
+BASE_URL = "https://tonapi.io/v2"
 
 
-async def fetch_lots(collection):
-    """
-    Получаем список лотов по коллекции через TonAPI
-    """
-    url = f"https://tonapi.io/v2/nfts/collections/{collection}/auctions"
+async def get_collection_floor(collection_address: str) -> float:
+    """Получить floor price коллекции (в TON)."""
+    url = f"{BASE_URL}/nft/collections/{collection_address}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=HEADERS)
-            r.raise_for_status()
-            return r.json().get("auctions", [])
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code == 200:
+                data = resp.json()
+                return float(data.get("floor_price", 0)) / 1e9  # nanoton → TON
+            else:
+                logger.warning(f"Не удалось получить floor {collection_address}: {resp.text}")
     except Exception as e:
-        logger.error(f"Ошибка запроса TonAPI для {collection}: {e}")
-        return []
+        logger.error(f"Ошибка получения floor: {e}")
+    return 0.0
 
 
-async def scan_collections():
+async def get_discounted_lots(collection_address: str, min_discount: float = 20.0, max_price: float = None):
     """
-    Основная функция сканера:
-    собираем лоты, считаем скидку и фильтруем
+    Получить лоты коллекции, которые продаются со скидкой относительно floor.
+    min_discount — минимальная скидка (в %).
+    max_price — максимальная цена (в TON).
     """
+    url = f"{BASE_URL}/nft/collections/{collection_address}/items?limit=50&sale_status=listed"
+
     results = []
+    try:
+        floor = await get_collection_floor(collection_address)
+        if floor == 0:
+            logger.warning(f"У коллекции {collection_address} нет floor, пропускаем")
+            return []
 
-    for collection in COLLECTIONS:
-        lots = await fetch_lots(collection)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code != 200:
+                logger.warning(f"Ошибка при получении лотов {collection_address}: {resp.text}")
+                return []
 
-        for lot in lots:
-            try:
-                price = float(lot.get("price", 0)) / 1e9  # в TON
-                floor = float(lot.get("nft", {}).get("collection", {}).get("floor_price", 0)) / 1e9
-
-                if not price or not floor:
+            items = resp.json().get("nft_items", [])
+            for item in items:
+                sale = item.get("sale")
+                if not sale:
                     continue
 
-                discount = (1 - price / floor) * 100
-
-                # фильтры
-                if discount < MIN_DISCOUNT:
-                    continue
-                if MAX_PRICE_TON and price > MAX_PRICE_TON:
+                price = float(sale.get("price", 0)) / 1e9  # в TON
+                if price <= 0:
                     continue
 
-                results.append({
-                    "collection": lot["nft"]["collection"]["name"],
-                    "name": lot["nft"]["metadata"].get("name", "Без имени"),
-                    "price": price,
-                    "floor": floor,
-                    "discount": discount,
-                    "image": lot["nft"]["metadata"].get("image"),
-                    "url": f"https://getgems.io/nft/{lot['nft']['address']}"
-                })
-            except Exception as e:
-                logger.warning(f"Ошибка обработки лота: {e}")
+                discount = 100 * (1 - (price / floor)) if floor > 0 else 0
 
-    return sorted(results, key=lambda x: x["discount"], reverse=True)
+                if discount >= min_discount and (max_price is None or price <= max_price):
+                    results.append({
+                        "name": item.get("metadata", {}).get("name", "No name"),
+                        "price": price,
+                        "floor": floor,
+                        "discount": discount,
+                        "image": item.get("previews", [{}])[0].get("url", ""),
+                        "url": f"https://getgems.io/asset/{item.get('address')}"
+                    })
+
+        results.sort(key=lambda x: x["discount"], reverse=True)
+        return results
+
+    except Exception as e:
+        logger.error(f"Ошибка в get_discounted_lots: {e}")
+        return []
