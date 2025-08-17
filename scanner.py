@@ -10,27 +10,22 @@ from aiogram import Bot
 
 from config import settings
 from db import (
-    get_pool,
-    get_or_create_scanner_settings,
-    get_scanner_users,
-    mark_deal_seen,
-    was_deal_seen,
+    get_scanner_users,               # без аргументов
+    get_or_create_scanner_settings,  # (user_id)
+    was_deal_seen,                   # (deal_id)
+    mark_deal_seen,                  # (deal_dict)
 )
 
 logger = logging.getLogger("nftbot.scanner")
 
-# Интервал по умолчанию между тиками цикла, если у пользователя не задан poll_seconds
 DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
 
-
 def _safe_user_id(item) -> Optional[int]:
-    """get_scanner_users может вернуть список int или список dict'ов."""
     if isinstance(item, int):
         return item
     if isinstance(item, dict):
         return item.get("user_id") or item.get("id")
     return None
-
 
 def _hash_deal(deal: Dict[str, Any]) -> str:
     raw = (
@@ -44,9 +39,7 @@ def _hash_deal(deal: Dict[str, Any]) -> str:
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-
 def _calc_discount_pct(deal: Dict[str, Any]) -> float:
-    """Если API вернёт fair_price или floor_price — посчитаем. Иначе 0."""
     fair = deal.get("fair_price_ton") or deal.get("floor_price_ton")
     try:
         fair = float(fair) if fair is not None else None
@@ -56,25 +49,18 @@ def _calc_discount_pct(deal: Dict[str, Any]) -> float:
         price = float(deal.get("price_ton") or 0.0)
     except Exception:
         price = 0.0
-
     if fair and fair > 0:
-        disc = max(0.0, (1.0 - price / fair) * 100.0)
-        return disc
+        return max(0.0, (1.0 - price / fair) * 100.0)
     return float(deal.get("discount_pct") or 0.0)
 
-
 def _passes_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
-    # Скидка
-    min_disc = float(st.get("min_discount_pct") or 0)
+    min_disc = float(st.get("min_discount_pct") or st.get("min_discount") or 0)
     if _calc_discount_pct(deal) + 1e-9 < min_disc:
         return False
-
-    # Цена
     try:
         p = float(deal.get("price_ton") or 0.0)
     except Exception:
         p = 0.0
-
     min_price = st.get("min_price_ton")
     if min_price not in (None, ""):
         try:
@@ -82,7 +68,6 @@ def _passes_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
                 return False
         except Exception:
             pass
-
     max_price = st.get("max_price_ton")
     if max_price not in (None, ""):
         try:
@@ -90,16 +75,12 @@ def _passes_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
                 return False
         except Exception:
             pass
-
-    # Коллекции
     cols = st.get("collections") or []
     if cols:
         col = str(deal.get("collection") or deal.get("collection_address") or "").lower()
         if col and col not in {c.lower() for c in cols}:
             return False
-
     return True
-
 
 def _format_deal_msg(deal: Dict[str, Any]) -> str:
     name = deal.get("name") or deal.get("nft_name") or "NFT"
@@ -124,22 +105,16 @@ def _format_deal_msg(deal: Dict[str, Any]) -> str:
         lines.append(f"\n<a href=\"{url}\">Открыть лот</a>")
     return "\n".join(lines)
 
-
 async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
-    """
-    Пробуем TonAPI. Если не доступно — возвращаем [].
-    """
     token = getattr(settings, "TONAPI_TOKEN", None) or os.getenv("TONAPI_TOKEN")
     if not token:
         logger.debug("TONAPI_TOKEN не задан — пропускаю тик.")
         return []
-
     headers = {"Authorization": f"Bearer {token}"}
     endpoints = [
         "https://tonapi.io/v2/marketplace/orders?limit=50",
         "https://tonapi.io/v2/market/active-orders?limit=50",
     ]
-
     async with httpx.AsyncClient(timeout=10) as client:
         for url in endpoints:
             try:
@@ -150,10 +125,10 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                 items = []
 
                 candidates = (
-                    data.get("orders")
-                    or data.get("items")
-                    or data.get("nft_items")
-                    or []
+                    data.get("orders") or
+                    data.get("items") or
+                    data.get("nft_items") or
+                    []
                 )
 
                 for it in candidates:
@@ -188,19 +163,15 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                     return items
             except Exception:
                 continue
-
     return []
 
-
-async def _notify_user(bot: Bot, pool, user_id: int, deals: List[Dict[str, Any]]):
-    # Отошлём до 3 свежих подходящих лотов за тик
+async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
     for d in deals[:3]:
         deal_hash = _hash_deal(d)
         try:
-            if await was_deal_seen(pool, user_id, deal_hash):
+            if await was_deal_seen(deal_hash):
                 continue
         except Exception:
-            # Если БД недоступна — всё равно пробуем слать, но без дедупа
             pass
 
         msg = _format_deal_msg(d)
@@ -210,15 +181,21 @@ async def _notify_user(bot: Bot, pool, user_id: int, deals: List[Dict[str, Any]]
             logger.warning(f"Не удалось отправить сообщение {user_id}: {e}")
 
         try:
-            await mark_deal_seen(pool, user_id, deal_hash)
+            await mark_deal_seen({
+                "deal_id": deal_hash,
+                "url": d.get("url"),
+                "collection": d.get("collection"),
+                "name": d.get("name"),
+                "price_ton": d.get("price_ton"),
+                "floor_ton": d.get("fair_price_ton") or d.get("floor_price_ton"),
+                "discount": _calc_discount_pct(d),
+            })
         except Exception:
             pass
 
-
-async def scanner_tick(bot: Bot, pool):
-    """Один проход сканирования для всех включённых пользователей."""
+async def scanner_tick(bot: Bot):
     try:
-        users = await get_scanner_users(pool)
+        users = await get_scanner_users()
     except Exception as e:
         logger.warning(f"get_scanner_users() failed: {e}")
         users = []
@@ -238,42 +215,35 @@ async def scanner_tick(bot: Bot, pool):
             continue
 
         try:
-            st = await get_or_create_scanner_settings(pool, user_id)
+            st = await get_or_create_scanner_settings(user_id)
         except Exception as e:
             logger.warning(f"get_or_create_scanner_settings({user_id}) failed: {e}")
             continue
 
-        if not st.get("enabled"):
+        if not st.get("enabled") and not st.get("scanner_enabled"):
+            # На случай, если храним только в app_users, а не в settings
             continue
 
         filtered = [d for d in all_deals if _passes_filters(d, st)]
         if not filtered:
             continue
 
-        await _notify_user(bot, pool, user_id, filtered)
-
+        await _notify_user(bot, user_id, filtered)
 
 async def scanner_loop():
-    """
-    Главный фоновый цикл.
-    Создаёт собственного бота (без конфликтов с основным), тикает с интервалом.
-    """
     bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
     logger.info("Scanner loop started")
 
-    # Готовим пул БД один раз
-    pool = await get_pool()
-
     async def _calc_sleep_default() -> int:
         try:
-            users = await get_scanner_users(pool)
+            users = await get_scanner_users()
             mins = []
             for u in users or []:
                 uid = _safe_user_id(u)
                 if not uid:
                     continue
-                st = await get_or_create_scanner_settings(pool, uid)
-                if st.get("enabled"):
+                st = await get_or_create_scanner_settings(uid)
+                if st.get("enabled") or st.get("scanner_enabled"):
                     mins.append(int(st.get("poll_seconds") or 60))
             if mins:
                 return max(10, min(mins))
@@ -285,7 +255,7 @@ async def scanner_loop():
 
     while True:
         try:
-            await scanner_tick(bot, pool)
+            await scanner_tick(bot)
         except Exception as e:
             logger.exception(f"scanner_tick crashed: {e}")
 
