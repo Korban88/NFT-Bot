@@ -139,9 +139,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
 
     # Кандидаты эндпоинтов (будем пробовать по очереди; формат ответа разный — приводим к общему).
     endpoints = [
-        # гипотетический список маркет-ордеров:
         "https://tonapi.io/v2/marketplace/orders?limit=50",
-        # запасной вариант (если другой маршрут):
         "https://tonapi.io/v2/market/active-orders?limit=50",
     ]
 
@@ -154,8 +152,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                 data = r.json()
                 items = []
 
-                # Нормализация под наши поля
-                # Популярные варианты ключей в ответах — подстрахуемся:
                 candidates = (
                     data.get("orders") or
                     data.get("items") or
@@ -194,7 +190,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                 if items:
                     return items
             except Exception:
-                # не шумим — просто пробуем следующий
                 continue
 
     return []
@@ -208,7 +203,6 @@ async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
             if await was_deal_seen(user_id, deal_hash):
                 continue
         except Exception:
-            # Если БД недоступна — всё равно пробуем слать, но без дедупа
             pass
 
         msg = _format_deal_msg(d)
@@ -234,14 +228,12 @@ async def scanner_tick(bot: Bot):
     if not users:
         return
 
-    # Грузим общий пул лотов один раз
     try:
         all_deals = await _fetch_from_tonapi()
     except Exception as e:
         logger.warning(f"TonAPI fetch failed: {e}")
         all_deals = []
 
-    # По пользователям — фильтруем и шлём
     for u in users:
         user_id = _safe_user_id(u)
         if not user_id:
@@ -253,7 +245,6 @@ async def scanner_tick(bot: Bot):
             logger.warning(f"get_or_create_scanner_settings({user_id}) failed: {e}")
             continue
 
-        # Только включённый сканер
         if not st.get("enabled"):
             continue
 
@@ -272,10 +263,8 @@ async def scanner_loop():
     bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
     logger.info("Scanner loop started")
 
-    # Базовый тик
-    sleep_seconds = DEFAULT_TICK_SECONDS
-    # Подстраиваемся под минимальный poll_seconds из включённых пользователей
-    # (если не получится — останется DEFAULT_TICK_SECONDS)
+    DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
+
     async def _calc_sleep_default() -> int:
         try:
             users = await get_scanner_users()
@@ -293,7 +282,6 @@ async def scanner_loop():
             pass
         return DEFAULT_TICK_SECONDS
 
-    # Первый расчёт
     sleep_seconds = await _calc_sleep_default()
 
     while True:
@@ -302,7 +290,6 @@ async def scanner_loop():
         except Exception as e:
             logger.exception(f"scanner_tick crashed: {e}")
 
-        # Периодически пересчитаем интервал — вдруг пользователь менял настройки
         try:
             sleep_seconds = await _calc_sleep_default()
         except Exception:
