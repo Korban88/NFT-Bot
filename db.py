@@ -69,7 +69,8 @@ async def init_db():
 
 # --- Settings ---
 
-async def set_wallet(pool: asyncpg.pool.Pool, address: str):
+async def set_wallet(address: str):
+    pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
             INSERT INTO app_settings (id, wallet_address)
@@ -77,14 +78,16 @@ async def set_wallet(pool: asyncpg.pool.Pool, address: str):
             ON CONFLICT (id) DO UPDATE SET wallet_address = EXCLUDED.wallet_address
         """, address)
 
-async def get_wallet(pool: asyncpg.pool.Pool) -> str:
+async def get_wallet() -> str:
+    pool = await get_pool()
     async with pool.acquire() as con:
         row = await con.fetchrow("SELECT wallet_address FROM app_settings WHERE id=1")
         return (row["wallet_address"] or "") if row else ""
 
 # --- Scanner settings ---
 
-async def get_or_create_scanner_settings(pool: asyncpg.pool.Pool, user_id: int) -> Dict[str, Any]:
+async def get_or_create_scanner_settings(user_id: int) -> Dict[str, Any]:
+    pool = await get_pool()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
             SELECT user_id, min_discount, max_price_ton, collections
@@ -98,7 +101,7 @@ async def get_or_create_scanner_settings(pool: asyncpg.pool.Pool, user_id: int) 
         """, user_id)
         return {"user_id": user_id, "min_discount": 25.0, "max_price_ton": None, "collections": None}
 
-async def update_scanner_settings(pool: asyncpg.pool.Pool, user_id: int, **kwargs):
+async def update_scanner_settings(user_id: int, **kwargs):
     if not kwargs:
         return
     fields = []
@@ -110,12 +113,14 @@ async def update_scanner_settings(pool: asyncpg.pool.Pool, user_id: int, **kwarg
         i += 1
     values.append(user_id)
     q = f"UPDATE app_scanner_settings SET {', '.join(fields)}, updated_at=NOW() WHERE user_id=${i}"
-    async with (await get_pool()).acquire() as con:
+    pool = await get_pool()
+    async with pool.acquire() as con:
         await con.execute(q, *values)
 
 # --- Users ---
 
-async def set_scanner_enabled(pool: asyncpg.pool.Pool, user_id: int, enabled: bool):
+async def set_scanner_enabled(user_id: int, enabled: bool):
+    pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
             INSERT INTO app_users (user_id, scanner_enabled)
@@ -123,19 +128,22 @@ async def set_scanner_enabled(pool: asyncpg.pool.Pool, user_id: int, enabled: bo
             ON CONFLICT (user_id) DO UPDATE SET scanner_enabled=$2, updated_at=NOW()
         """, user_id, enabled)
 
-async def get_scanner_users(pool: asyncpg.pool.Pool) -> List[int]:
+async def get_scanner_users() -> List[int]:
+    pool = await get_pool()
     async with pool.acquire() as con:
         rows = await con.fetch("SELECT user_id FROM app_users WHERE scanner_enabled=TRUE")
         return [int(r["user_id"]) for r in rows]
 
 # --- Deals ---
 
-async def was_deal_seen(pool: asyncpg.pool.Pool, deal_id: str) -> bool:
+async def was_deal_seen(deal_id: str) -> bool:
+    pool = await get_pool()
     async with pool.acquire() as con:
         row = await con.fetchrow("SELECT 1 FROM app_found_deals WHERE deal_id=$1", deal_id)
         return row is not None
 
-async def mark_deal_seen(pool: asyncpg.pool.Pool, deal: Dict[str, Any]):
+async def mark_deal_seen(deal: Dict[str, Any]):
+    pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
             INSERT INTO app_found_deals (deal_id, url, collection, name, price_ton, floor_ton, discount)
