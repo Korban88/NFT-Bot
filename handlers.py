@@ -1,7 +1,6 @@
 # handlers.py
-import hashlib
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from aiogram import Dispatcher, types
 from aiogram.types import (
@@ -11,14 +10,12 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from config import settings
 from db import (
-    get_pool,
-    get_or_create_scanner_settings,   # ожидает (pool, user_id)
-    get_wallet,                       # ожидает (user_id)
-    set_wallet,                       # ожидает (user_id, address)
-    update_scanner_settings,          # ожидает (user_id, patch_dict)
-    set_scanner_enabled,              # ожидает (user_id, enabled)
+    get_or_create_scanner_settings,  # (user_id)
+    get_wallet,                      # ()
+    set_wallet,                      # (user_id, address)
+    update_scanner_settings,         # (user_id, **kwargs)
+    set_scanner_enabled,             # (user_id, enabled)
 )
 
 # ------------------------------------------------------------
@@ -44,8 +41,8 @@ def _format_scanner_settings(st: Dict[str, Any]) -> str:
             return str(v)
 
     parts = [
-        f"Сканер: {'включен' if st.get('enabled') else 'выключен'}",
-        f"Скидка (мин): {float(st.get('min_discount_pct') or 0):.0f} %",
+        f"Сканер: {'включен' if st.get('enabled') or st.get('scanner_enabled') else 'выключен'}",
+        f"Скидка (мин): {float(st.get('min_discount_pct') or st.get('min_discount') or 0):.0f} %",
         f"Цена (мин): {fmt_ton(Decimal(str(st.get('min_price_ton'))) if st.get('min_price_ton') is not None else None)}",
         f"Цена (макс): {fmt_ton(Decimal(str(st.get('max_price_ton'))) if st.get('max_price_ton') is not None else None)}",
         f"Коллекции: {', '.join(st.get('collections') or []) if st.get('collections') else 'все'}",
@@ -55,10 +52,10 @@ def _format_scanner_settings(st: Dict[str, Any]) -> str:
 
 
 async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
-    pool = await get_pool()
-    st = await get_or_create_scanner_settings(pool, user_id)
+    st = await get_or_create_scanner_settings(user_id)
+    # Значения по умолчанию / приведение ключей к ожидаемым
     st.setdefault("enabled", False)
-    st.setdefault("min_discount_pct", 20)
+    st.setdefault("min_discount_pct", st.get("min_discount", 20))
     st.setdefault("min_price_ton", None)
     st.setdefault("max_price_ton", None)
     st.setdefault("collections", [])
@@ -72,7 +69,7 @@ async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
 
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Я NFT-бот. Слежу за выгодными лотами на TON маркетах и могу показать твою коллекцию.\n"
+        "Привет! Я NFT-бот. Слежу за выгодными лотами на TON-маркетах и могу показать твою коллекцию.\n"
         "Используй кнопки ниже.",
         reply_markup=_main_reply_kb(),
     )
@@ -81,7 +78,7 @@ async def cmd_start(message: types.Message):
 async def cmd_status(message: types.Message):
     user_id = message.from_user.id
     st = await _ensure_user_settings(user_id)
-    wallet = await get_wallet(user_id)
+    wallet = await get_wallet()
     wallet_str = wallet or "не привязан"
     text = (
         f"👤 Пользователь: {user_id}\n"
@@ -92,7 +89,7 @@ async def cmd_status(message: types.Message):
 
 
 async def cmd_wallet(message: types.Message):
-    wallet = await get_wallet(message.from_user.id)
+    wallet = await get_wallet()
     if wallet:
         await message.answer(
             f"Текущий TON-адрес: <code>{wallet}</code>\n"
@@ -107,6 +104,7 @@ async def cmd_wallet(message: types.Message):
 
 
 async def on_plain_address(message: types.Message):
+    # Простая эвристика валидации TON-адреса (friendly/raw)
     text = (message.text or "").strip()
     if len(text) < 48 or len(text) > 80:
         return
@@ -161,7 +159,7 @@ async def cb_settings(call: types.CallbackQuery):
             cur = int(st.get("min_discount_pct") or 0)
             cur = max(0, min(90, cur + delta))
             st["min_discount_pct"] = cur
-            await update_scanner_settings(user_id, {"min_discount_pct": cur})
+            await update_scanner_settings(user_id, min_discount=cur)
 
         elif data.startswith("min_price:"):
             delta = Decimal(data.split(":", 1)[1])
@@ -169,7 +167,7 @@ async def cb_settings(call: types.CallbackQuery):
             cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
             st["min_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, {"min_price_ton": str(cur)})
+            await update_scanner_settings(user_id, min_price_ton=str(cur))
 
         elif data.startswith("max_price:"):
             delta = Decimal(data.split(":", 1)[1])
@@ -177,18 +175,18 @@ async def cb_settings(call: types.CallbackQuery):
             cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
             st["max_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, {"max_price_ton": str(cur)})
+            await update_scanner_settings(user_id, max_price_ton=str(cur))
 
         elif data.startswith("poll:"):
             delta = int(data.split(":", 1)[1])
             cur = int(st.get("poll_seconds") or 60)
             cur = max(10, min(3600, cur + delta))
             st["poll_seconds"] = cur
-            await update_scanner_settings(user_id, {"poll_seconds": cur})
+            await update_scanner_settings(user_id, poll_seconds=cur)
 
         elif data == "cols:clear":
             st["collections"] = []
-            await update_scanner_settings(user_id, {"collections": []})
+            await update_scanner_settings(user_id, collections=[])
 
         await call.answer("Обновлено")
         await call.message.edit_text(
