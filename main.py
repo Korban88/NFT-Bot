@@ -16,8 +16,8 @@ logger = logging.getLogger("nftbot")
 
 async def on_startup(dp: Dispatcher):
     logger.info("Starting NFT bot (Iteration 1 / Step 1)...")
-    # Запускаем фоновый сканер
-    dp.loop.create_task(scanner_loop())
+    # Запускаем фоновый сканер корректно для aiogram v2:
+    asyncio.create_task(scanner_loop())
 
 
 def main():
