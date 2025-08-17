@@ -1,122 +1,234 @@
-# ... всё то же самое сверху без изменений ...
+# handlers.py
+import asyncio
+import os
+import hashlib
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import List, Dict, Any, Optional  # важно: чтобы не было NameError
 
-async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
-    if not TON_COLLECTIONS:
-        return []
-    headers = {}
-    if getattr(settings, "TONAPI_KEY", None):
-        headers["Authorization"] = f"Bearer {settings.TONAPI_KEY}"
+import httpx
+from aiogram import Dispatcher, types
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 
-    rows: List[Dict[str, Any]] = []
+from config import settings
+from db import (
+    get_pool, set_wallet, get_wallet,
+    get_or_create_scanner_settings, update_scanner_settings,
+    set_scanner_enabled, get_scanner_users,
+    was_deal_seen, mark_deal_seen
+)
+
+# ------------------------------------------------------------
+# Вспомогательные утилиты форматирования
+# ------------------------------------------------------------
+
+def _main_reply_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("🏁 Старт"))
+    kb.add(KeyboardButton("👛 Кошелёк"), KeyboardButton("🛠 Настройки сканера"))
+    kb.add(KeyboardButton("▶️ Включить сканер"), KeyboardButton("⏸ Выключить сканер"))
+    kb.add(KeyboardButton("ℹ️ Статус"))
+    return kb
+
+
+def _format_scanner_settings(st: Dict[str, Any]) -> str:
+    def fmt_ton(v: Optional[Decimal]) -> str:
+        if v is None:
+            return "нет"
+        try:
+            return f"{float(v):.3f} TON"
+        except Exception:
+            return str(v)
+
+    parts = [
+        f"Сканер: {'включен' if st.get('enabled') else 'выключен'}",
+        f"Скидка (мин): {st.get('min_discount_pct') or 0:.0f} %",
+        f"Цена (мин): {fmt_ton(st.get('min_price_ton'))}",
+        f"Цена (макс): {fmt_ton(st.get('max_price_ton'))}",
+        f"Коллекции: {', '.join(st.get('collections') or []) if st.get('collections') else 'все'}",
+        f"Период обновления: {st.get('poll_seconds') or 60}s",
+    ]
+    return "\n".join(parts)
+
+
+async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
+    st = await get_or_create_scanner_settings(user_id)
+    if "enabled" not in st:
+        st["enabled"] = False
+    return st
+
+
+# ------------------------------------------------------------
+# Команды и хэндлеры
+# ------------------------------------------------------------
+
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Привет! Я NFT-бот. Могу сканировать выгодные лоты в TON и показывать твою коллекцию.\n"
+        "Используй кнопки ниже.",
+        reply_markup=_main_reply_kb(),
+    )
+
+
+async def cmd_status(message: types.Message):
+    user_id = message.from_user.id
+    st = await _ensure_user_settings(user_id)
+    wallet = await get_wallet(user_id)
+    wallet_str = wallet or "не привязан"
+    text = (
+        f"👤 Пользователь: {user_id}\n"
+        f"👛 Кошелёк: {wallet_str}\n\n"
+        f"🛠 Текущие настройки сканера:\n{_format_scanner_settings(st)}"
+    )
+    await message.answer(text, reply_markup=_main_reply_kb())
+
+
+async def cmd_wallet(message: types.Message):
+    wallet = await get_wallet(message.from_user.id)
+    if wallet:
+        await message.answer(
+            f"Текущий TON-адрес: <code>{wallet}</code>\n"
+            f"Чтобы заменить — отправь новый адрес в одном сообщении.",
+            reply_markup=_main_reply_kb(),
+        )
+    else:
+        await message.answer(
+            "Кошелёк ещё не привязан. Отправь TON-адрес одним сообщением, я сохраню.",
+            reply_markup=_main_reply_kb(),
+        )
+
+
+async def on_plain_address(message: types.Message):
+    # Простейшая валидация TON-адреса (tonapi формат friendly)
+    text = (message.text or "").strip()
+    if len(text) < 48 or len(text) > 80:
+        return  # игнорим, пусть ловят другие хэндлеры
+    if not any(ch.isalnum() for ch in text):
+        return
+    # Сохраняем как есть (адреса бывают разного формата: raw/friendly)
+    await set_wallet(message.from_user.id, text)
+    await message.answer(
+        f"Сохранил TON-адрес: <code>{text}</code>",
+        reply_markup=_main_reply_kb(),
+    )
+
+
+async def cmd_scanner_settings(message: types.Message):
+    user_id = message.from_user.id
+    st = await _ensure_user_settings(user_id)
+
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("Мин. скидка −5%", callback_data="min_disc:-5"),
+        InlineKeyboardButton("Мин. скидка +5%", callback_data="min_disc:+5"),
+    )
+    kb.add(
+        InlineKeyboardButton("Мин. цена −0.5 TON", callback_data="min_price:-0.5"),
+        InlineKeyboardButton("Мин. цена +0.5 TON", callback_data="min_price:+0.5"),
+    )
+    kb.add(
+        InlineKeyboardButton("Макс. цена −0.5 TON", callback_data="max_price:-0.5"),
+        InlineKeyboardButton("Макс. цена +0.5 TON", callback_data="max_price:+0.5"),
+    )
+    kb.add(
+        InlineKeyboardButton("Интервал −10s", callback_data="poll:-10"),
+        InlineKeyboardButton("Интервал +10s", callback_data="poll:+10"),
+    )
+    kb.add(
+        InlineKeyboardButton("Очистить коллекции", callback_data="cols:clear"),
+    )
+
+    await message.answer(
+        "🛠 Настройки сканера:\n"
+        + _format_scanner_settings(st)
+        + "\n\nПодправь параметры кнопками ниже.",
+        reply_markup=kb,
+    )
+
+
+async def cb_settings(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    st = await _ensure_user_settings(user_id)
+    data = call.data or ""
+
     try:
-        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            total_cap = 200
-            for coll_addr in TON_COLLECTIONS:
-                if total_cap <= 0:
-                    break
-                items = await _fetch_collection_items(client, coll_addr)
-                for it in items:
-                    sale = it.get("sale") or it.get("marketplace")
-                    if not isinstance(sale, dict):
-                        continue
+        if data.startswith("min_disc:"):
+            delta = int(data.split(":", 1)[1])
+            cur = int(st.get("min_discount_pct") or 0)
+            cur = max(0, min(90, cur + delta))
+            st["min_discount_pct"] = cur
+            await update_scanner_settings(user_id, {"min_discount_pct": cur})
 
-                    addr = it.get("address") or ""
-                    if not addr:
-                        continue
+        elif data.startswith("min_price:"):
+            delta = Decimal(data.split(":", 1)[1])
+            cur = Decimal(st.get("min_price_ton") or 0)
+            cur = max(Decimal("0"), cur + delta)
+            st["min_price_ton"] = cur
+            await update_scanner_settings(user_id, {"min_price_ton": str(cur)})
 
-                    price_ton = _extract_sale_price_ton(sale)
+        elif data.startswith("max_price:"):
+            delta = Decimal(data.split(":", 1)[1])
+            cur_raw = st.get("max_price_ton")
+            cur = Decimal(cur_raw) if cur_raw is not None else Decimal("0")
+            cur = max(Decimal("0"), cur + delta)
+            st["max_price_ton"] = cur
+            await update_scanner_settings(user_id, {"max_price_ton": str(cur)})
 
-                    img = None
-                    previews = it.get("previews") or []
-                    if isinstance(previews, list) and previews:
-                        img = previews[-1].get("url") or previews[0].get("url")
+        elif data.startswith("poll:"):
+            delta = int(data.split(":", 1)[1])
+            cur = int(st.get("poll_seconds") or 60)
+            cur = max(10, min(3600, cur + delta))
+            st["poll_seconds"] = cur
+            await update_scanner_settings(user_id, {"poll_seconds": cur})
 
-                    name = (it.get("metadata") or {}).get("name") or addr
-                    ts = _parse_iso_ts(sale.get("created_at")) or _parse_iso_ts(it.get("created_at")) \
-                         or int(_now_utc().timestamp())
+        elif data == "cols:clear":
+            st["collections"] = []
+            await update_scanner_settings(user_id, {"collections": []})
 
-                    url_view = _tonviewer_url(addr)
-                    gg_url = None
-                    market_name = (sale.get("marketplace") or {}).get("name") if isinstance(sale.get("marketplace"), dict) else sale.get("market") or sale.get("name")
-                    if isinstance(market_name, str) and "getgems" in market_name.lower():
-                        gg_url = _getgems_url(addr)
-
-                    rows.append({
-                        "name": name,
-                        "collection": coll_addr,
-                        "nft_address": addr,
-                        "price_ton": price_ton,
-                        "floor_ton": None,
-                        "median_ton": None,
-                        "discount_floor": None,
-                        "discount_med": None,
-                        "timestamp": ts,
-                        "url": url_view,
-                        "gg_url": gg_url,
-                        "image": img,
-                    })
-                    total_cap -= 1
-                    if total_cap <= 0:
-                        break
-    except Exception:
-        return []
-
-    # 🔥 фикс: считаем floor и median правильно
-    by_coll: Dict[str, List[float]] = {}
-    for x in rows:
-        p = _safe_decimal(x.get("price_ton"))
-        if p and p > 0:
-            by_coll.setdefault(x["collection"], []).append(float(p))
-
-    floors: Dict[str, float] = {c: min(v) for c, v in by_coll.items() if v}
-    medians: Dict[str, float] = {c: _median(v) for c, v in by_coll.items() if v}
-
-    for x in rows:
-        coll = x["collection"]
-        floor = floors.get(coll)
-        med = medians.get(coll)
-        if floor:
-            x["floor_ton"] = floor
-        if med:
-            x["median_ton"] = med
-
-        price = x.get("price_ton")
-        if price and floor:
-            try:
-                x["discount_floor"] = _pct(float(price), float(floor))
-            except Exception:
-                pass
-        if price and med:
-            try:
-                x["discount_med"] = _pct(float(price), float(med))
-            except Exception:
-                pass
-
-    return rows
+        await call.answer("Обновлено")
+        await call.message.edit_text(
+            "🛠 Настройки сканера обновлены:\n" + _format_scanner_settings(st),
+            reply_markup=call.message.reply_markup,
+        )
+    except InvalidOperation:
+        await call.answer("Некорректное число", show_alert=True)
 
 
-# ======== Рендер карточки ========
-def _item_caption(it: Dict[str, Any]) -> str:
-    name = it.get("name") or "—"
-    coll = it.get("collection") or "—"
-    price = it.get("price_ton")
-    floor = it.get("floor_ton")
-    median = it.get("median_ton")
-    disc_floor = it.get("discount_floor")
-    disc_med = it.get("discount_med")
+async def cmd_scanner_on(message: types.Message):
+    user_id = message.from_user.id
+    await set_scanner_enabled(user_id, True)
+    await message.answer("Сканер включен ✅", reply_markup=_main_reply_kb())
 
-    lines = [f"🔥 {name}", f"Коллекция: {coll}"]
 
-    if price is not None:
-        lines.append(f"Цена: {float(price):.3f} TON")
-    if floor is not None and floor > 0:
-        lines.append(f"Floor: {float(floor):.3f} TON")
-    if median is not None and median > 0:
-        lines.append(f"Медиана: {float(median):.3f} TON")
+async def cmd_scanner_off(message: types.Message):
+    user_id = message.from_user.id
+    await set_scanner_enabled(user_id, False)
+    await message.answer("Сканер выключен ⏸", reply_markup=_main_reply_kb())
 
-    if disc_floor is not None:
-        lines.append(f"Скидка к floor: {float(disc_floor):.1f}%")
-    if disc_med is not None:
-        lines.append(f"Скидка к медиане: {float(disc_med):.1f}%")
 
-    return "\n".join(lines)
+# ------------------------------------------------------------
+# Регистрация хэндлеров
+# ------------------------------------------------------------
+
+def register_handlers(dp: Dispatcher) -> None:
+    # Команды
+    dp.register_message_handler(cmd_start, commands={"start"})
+    dp.register_message_handler(cmd_status, lambda m: m.text == "ℹ️ Статус")
+    dp.register_message_handler(cmd_wallet, lambda m: m.text == "👛 Кошелёк")
+    dp.register_message_handler(cmd_scanner_settings, lambda m: m.text == "🛠 Настройки сканера")
+    dp.register_message_handler(cmd_scanner_on, lambda m: m.text == "▶️ Включить сканер")
+    dp.register_message_handler(cmd_scanner_off, lambda m: m.text == "⏸ Выключить сканер")
+
+    # Кнопка старт (дублируем /start)
+    dp.register_message_handler(cmd_start, lambda m: m.text == "🏁 Старт")
+
+    # Прикрутим простой приём адреса — в самый конец, чтобы не перебивать команды
+    dp.register_message_handler(on_plain_address, content_types=types.ContentTypes.TEXT)
+
+    # Callback'и настроек
+    dp.register_callback_query_handler(cb_settings, lambda c: (c.data or "").split(":")[0] in {
+        "min_disc", "min_price", "max_price", "poll", "cols"
+    })
