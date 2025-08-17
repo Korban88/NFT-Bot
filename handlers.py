@@ -63,7 +63,7 @@ def build_ton_transfer_link(address: str, amount_ton: Decimal, comment: str) -> 
     return f"ton://transfer/{address}?amount={nanotons}&text={safe_comment}"
 
 def build_tonkeeper_link(address: str, amount_ton: Decimal, comment: str) -> str:
-    nanotons = int(amount_tон * TON_DECIMALS)
+    nanotons = int(amount_ton * TON_DECIMALS)
     return f"https://app.tonkeeper.com/transfer/{address}?amount={nanotons}&text={quote(comment)}"
 
 def build_tonhub_link(address: str, amount_ton: Decimal, comment: str) -> str:
@@ -139,6 +139,18 @@ def _safe_decimal(x) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         return None
 
+def _to_ton(value: Optional[Decimal]) -> Optional[float]:
+    if value is None:
+        return None
+    # Если значение похоже на нанотоны (большое), конвертируем
+    try:
+        v = Decimal(value)
+        if v > 1_000_000:  # эвристика
+            return float(v / TON_DECIMALS)
+        return float(v)
+    except Exception:
+        return None
+
 def _item_discount(it: Dict[str, Any]) -> Optional[float]:
     p = _safe_decimal(it.get("price_ton"))
     f = _safe_decimal(it.get("floor_ton"))
@@ -160,9 +172,13 @@ def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
                 return False
         except Exception:
             pass
-    # скидка
+    # скидка — ВАЖНО: если min_discount == 0 → НЕ фильтруем по скидке вовсе
     disc = it.get("discount")
-    if disc is not None and float(disc) < float(st.get("min_discount") or 0.0):
+    try:
+        min_disc = float(st.get("min_discount") or 0.0)
+    except Exception:
+        min_disc = 0.0
+    if min_disc > 0.0 and disc is not None and float(disc) < min_disc:
         return False
     # цена
     maxp = st.get("max_price_ton")
@@ -235,6 +251,36 @@ def _parse_iso_ts(s: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+def _extract_sale_price_ton(sale: Dict[str, Any]) -> Optional[float]:
+    """
+    Нормализуем цену из TonAPI:
+    - sale["price"] может быть числом/строкой в нанотонах
+    - либо объектом: {"value": "...", "token_name": "TON"} или {"amount":{"value":"..."}}
+    """
+    if sale is None:
+        return None
+    cand = None
+
+    # прямые варианты
+    for key in ("price", "full_price", "amount"):
+        val = sale.get(key)
+        if isinstance(val, (int, float, str, Decimal)):
+            cand = _safe_decimal(val)
+            if cand is not None:
+                break
+        if isinstance(val, dict):
+            # amount: {"value":"..."}  |  price: {"value":"...","token_name":"TON"}
+            inner = val.get("value") or val.get("amount") or val.get("nano") or None
+            cand = _safe_decimal(inner)
+            if cand is not None:
+                break
+
+    # последний шанс — прямое поле "value"
+    if cand is None:
+        cand = _safe_decimal(sale.get("value"))
+
+    return _to_ton(cand)
+
 async def _fetch_from_json_feed() -> List[Dict[str, Any]]:
     if not LISTINGS_FEED_URL:
         return []
@@ -281,7 +327,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            total_cap = 120
+            total_cap = 160  # общий колпак на проход
             for coll_addr in TON_COLLECTIONS:
                 if total_cap <= 0:
                     break
@@ -296,11 +342,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                         continue
 
                     # цена
-                    price_ton = None
-                    raw_price = sale.get("price") or sale.get("full_price") or sale.get("amount")
-                    d = _safe_decimal(raw_price)
-                    if d and d > 0:
-                        price_ton = float(d / TON_DECIMALS)
+                    price_ton = _extract_sale_price_ton(sale)
 
                     # превью
                     img = None
