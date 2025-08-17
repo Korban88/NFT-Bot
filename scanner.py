@@ -1,19 +1,20 @@
 # scanner.py
 import asyncio
+import hashlib
 import logging
 import os
-import hashlib
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from aiogram import Bot
 
 from config import settings
 from db import (
-    get_scanner_users,
+    get_pool,
     get_or_create_scanner_settings,
-    was_deal_seen,
+    get_scanner_users,
     mark_deal_seen,
+    was_deal_seen,
 )
 
 logger = logging.getLogger("nftbot.scanner")
@@ -126,9 +127,7 @@ def _format_deal_msg(deal: Dict[str, Any]) -> str:
 
 async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     """
-    Заглушка-реализация запроса к TonAPI.
-    Пытаемся обратиться к одному из известных маршрутов.
-    Если ничего не доступно/неизвестно — возвращаем [].
+    Пробуем TonAPI. Если не доступно — возвращаем [].
     """
     token = getattr(settings, "TONAPI_TOKEN", None) or os.getenv("TONAPI_TOKEN")
     if not token:
@@ -136,8 +135,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
         return []
 
     headers = {"Authorization": f"Bearer {token}"}
-
-    # Кандидаты эндпоинтов (будем пробовать по очереди; формат ответа разный — приводим к общему).
     endpoints = [
         "https://tonapi.io/v2/marketplace/orders?limit=50",
         "https://tonapi.io/v2/market/active-orders?limit=50",
@@ -153,10 +150,10 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                 items = []
 
                 candidates = (
-                    data.get("orders") or
-                    data.get("items") or
-                    data.get("nft_items") or
-                    []
+                    data.get("orders")
+                    or data.get("items")
+                    or data.get("nft_items")
+                    or []
                 )
 
                 for it in candidates:
@@ -195,14 +192,15 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     return []
 
 
-async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
+async def _notify_user(bot: Bot, pool, user_id: int, deals: List[Dict[str, Any]]):
     # Отошлём до 3 свежих подходящих лотов за тик
     for d in deals[:3]:
         deal_hash = _hash_deal(d)
         try:
-            if await was_deal_seen(user_id, deal_hash):
+            if await was_deal_seen(pool, user_id, deal_hash):
                 continue
         except Exception:
+            # Если БД недоступна — всё равно пробуем слать, но без дедупа
             pass
 
         msg = _format_deal_msg(d)
@@ -212,15 +210,15 @@ async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
             logger.warning(f"Не удалось отправить сообщение {user_id}: {e}")
 
         try:
-            await mark_deal_seen(user_id, deal_hash)
+            await mark_deal_seen(pool, user_id, deal_hash)
         except Exception:
             pass
 
 
-async def scanner_tick(bot: Bot):
+async def scanner_tick(bot: Bot, pool):
     """Один проход сканирования для всех включённых пользователей."""
     try:
-        users = await get_scanner_users()
+        users = await get_scanner_users(pool)
     except Exception as e:
         logger.warning(f"get_scanner_users() failed: {e}")
         users = []
@@ -240,7 +238,7 @@ async def scanner_tick(bot: Bot):
             continue
 
         try:
-            st = await get_or_create_scanner_settings(user_id)
+            st = await get_or_create_scanner_settings(pool, user_id)
         except Exception as e:
             logger.warning(f"get_or_create_scanner_settings({user_id}) failed: {e}")
             continue
@@ -252,7 +250,7 @@ async def scanner_tick(bot: Bot):
         if not filtered:
             continue
 
-        await _notify_user(bot, user_id, filtered)
+        await _notify_user(bot, pool, user_id, filtered)
 
 
 async def scanner_loop():
@@ -263,17 +261,18 @@ async def scanner_loop():
     bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
     logger.info("Scanner loop started")
 
-    DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
+    # Готовим пул БД один раз
+    pool = await get_pool()
 
     async def _calc_sleep_default() -> int:
         try:
-            users = await get_scanner_users()
+            users = await get_scanner_users(pool)
             mins = []
             for u in users or []:
                 uid = _safe_user_id(u)
                 if not uid:
                     continue
-                st = await get_or_create_scanner_settings(uid)
+                st = await get_or_create_scanner_settings(pool, uid)
                 if st.get("enabled"):
                     mins.append(int(st.get("poll_seconds") or 60))
             if mins:
@@ -286,7 +285,7 @@ async def scanner_loop():
 
     while True:
         try:
-            await scanner_tick(bot)
+            await scanner_tick(bot, pool)
         except Exception as e:
             logger.exception(f"scanner_tick crashed: {e}")
 
