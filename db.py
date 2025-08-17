@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS app_scanner_settings (
     min_discount NUMERIC(5,2) NOT NULL DEFAULT 25.0,
     max_price_ton NUMERIC(32,9),
     collections TEXT[],
+    -- новые поля могут отсутствовать в уже существующей таблице — добавим их через ALTER в init_db()
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -65,7 +66,14 @@ async def get_pool() -> asyncpg.pool.Pool:
 async def init_db():
     pool = await get_pool()
     async with pool.acquire() as con:
+        # Базовые таблицы
         await con.execute(INIT_SQL)
+        # Миграции — добавляем недостающие поля, если их нет
+        await con.execute("""
+            ALTER TABLE app_scanner_settings
+                ADD COLUMN IF NOT EXISTS min_price_ton NUMERIC(32,9),
+                ADD COLUMN IF NOT EXISTS poll_seconds INTEGER NOT NULL DEFAULT 60;
+        """)
 
 # --- Settings ---
 
@@ -90,7 +98,7 @@ async def get_or_create_scanner_settings(user_id: int) -> Dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
-            SELECT user_id, min_discount, max_price_ton, collections
+            SELECT user_id, min_discount, max_price_ton, min_price_ton, poll_seconds, collections
             FROM app_scanner_settings WHERE user_id=$1
         """, user_id)
         if row:
@@ -99,7 +107,15 @@ async def get_or_create_scanner_settings(user_id: int) -> Dict[str, Any]:
             INSERT INTO app_scanner_settings (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO NOTHING
         """, user_id)
-        return {"user_id": user_id, "min_discount": 25.0, "max_price_ton": None, "collections": None}
+        # Значения по умолчанию, согласованные с схемой
+        return {
+            "user_id": user_id,
+            "min_discount": 25.0,
+            "max_price_ton": None,
+            "min_price_ton": None,
+            "poll_seconds": 60,
+            "collections": None
+        }
 
 async def update_scanner_settings(user_id: int, **kwargs):
     if not kwargs:
