@@ -45,19 +45,24 @@ def _format_scanner_settings(st: Dict[str, Any]) -> str:
 
     parts = [
         f"Сканер: {'включен' if st.get('enabled') else 'выключен'}",
-        f"Скидка (мин): {st.get('min_discount_pct') or 0:.0f} %",
-        f"Цена (мин): {fmt_ton(st.get('min_price_ton'))}",
-        f"Цена (макс): {fmt_ton(st.get('max_price_ton'))}",
+        f"Скидка (мин): {float(st.get('min_discount_pct') or 0):.0f} %",
+        f"Цена (мин): {fmt_ton(Decimal(str(st.get('min_price_ton'))) if st.get('min_price_ton') is not None else None)}",
+        f"Цена (макс): {fmt_ton(Decimal(str(st.get('max_price_ton'))) if st.get('max_price_ton') is not None else None)}",
         f"Коллекции: {', '.join(st.get('collections') or []) if st.get('collections') else 'все'}",
-        f"Период обновления: {st.get('poll_seconds') or 60}s",
+        f"Период обновления: {int(st.get('poll_seconds') or 60)}s",
     ]
     return "\n".join(parts)
 
 
 async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
     st = await get_or_create_scanner_settings(user_id)
-    if "enabled" not in st:
-        st["enabled"] = False
+    # Значения по умолчанию
+    st.setdefault("enabled", False)
+    st.setdefault("min_discount_pct", 20)
+    st.setdefault("min_price_ton", None)
+    st.setdefault("max_price_ton", None)
+    st.setdefault("collections", [])
+    st.setdefault("poll_seconds", 60)
     return st
 
 
@@ -67,7 +72,7 @@ async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
 
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Я NFT-бот. Могу сканировать выгодные лоты в TON и показывать твою коллекцию.\n"
+        "Привет! Я NFT-бот. Слежу за выгодными лотами на TON маркетах и могу показать твою коллекцию.\n"
         "Используй кнопки ниже.",
         reply_markup=_main_reply_kb(),
     )
@@ -80,7 +85,7 @@ async def cmd_status(message: types.Message):
     wallet_str = wallet or "не привязан"
     text = (
         f"👤 Пользователь: {user_id}\n"
-        f"👛 Кошелёк: {wallet_str}\n\n"
+        f"👛 Кошелёк: <code>{wallet_str}</code>\n\n"
         f"🛠 Текущие настройки сканера:\n{_format_scanner_settings(st)}"
     )
     await message.answer(text, reply_markup=_main_reply_kb())
@@ -91,7 +96,7 @@ async def cmd_wallet(message: types.Message):
     if wallet:
         await message.answer(
             f"Текущий TON-адрес: <code>{wallet}</code>\n"
-            f"Чтобы заменить — отправь новый адрес в одном сообщении.",
+            f"Чтобы заменить — отправь новый адрес одним сообщением.",
             reply_markup=_main_reply_kb(),
         )
     else:
@@ -102,13 +107,13 @@ async def cmd_wallet(message: types.Message):
 
 
 async def on_plain_address(message: types.Message):
-    # Простейшая валидация TON-адреса (tonapi формат friendly)
+    # Простейшая валидация TON-адреса (friendly/raw)
     text = (message.text or "").strip()
     if len(text) < 48 or len(text) > 80:
         return  # игнорим, пусть ловят другие хэндлеры
     if not any(ch.isalnum() for ch in text):
         return
-    # Сохраняем как есть (адреса бывают разного формата: raw/friendly)
+    # Сохраняем как есть (адреса бывают raw/friendly)
     await set_wallet(message.from_user.id, text)
     await message.answer(
         f"Сохранил TON-адрес: <code>{text}</code>",
@@ -137,9 +142,7 @@ async def cmd_scanner_settings(message: types.Message):
         InlineKeyboardButton("Интервал −10s", callback_data="poll:-10"),
         InlineKeyboardButton("Интервал +10s", callback_data="poll:+10"),
     )
-    kb.add(
-        InlineKeyboardButton("Очистить коллекции", callback_data="cols:clear"),
-    )
+    kb.add(InlineKeyboardButton("Очистить коллекции", callback_data="cols:clear"))
 
     await message.answer(
         "🛠 Настройки сканера:\n"
@@ -164,17 +167,18 @@ async def cb_settings(call: types.CallbackQuery):
 
         elif data.startswith("min_price:"):
             delta = Decimal(data.split(":", 1)[1])
-            cur = Decimal(st.get("min_price_ton") or 0)
+            cur_raw = st.get("min_price_ton")
+            cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
-            st["min_price_ton"] = cur
+            st["min_price_ton"] = str(cur)
             await update_scanner_settings(user_id, {"min_price_ton": str(cur)})
 
         elif data.startswith("max_price:"):
             delta = Decimal(data.split(":", 1)[1])
             cur_raw = st.get("max_price_ton")
-            cur = Decimal(cur_raw) if cur_raw is not None else Decimal("0")
+            cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
-            st["max_price_ton"] = cur
+            st["max_price_ton"] = str(cur)
             await update_scanner_settings(user_id, {"max_price_ton": str(cur)})
 
         elif data.startswith("poll:"):
@@ -225,7 +229,7 @@ def register_handlers(dp: Dispatcher) -> None:
     # Кнопка старт (дублируем /start)
     dp.register_message_handler(cmd_start, lambda m: m.text == "🏁 Старт")
 
-    # Прикрутим простой приём адреса — в самый конец, чтобы не перебивать команды
+    # Приём адреса — в самый конец, чтобы не перебивать команды
     dp.register_message_handler(on_plain_address, content_types=types.ContentTypes.TEXT)
 
     # Callback'и настроек
