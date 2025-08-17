@@ -33,10 +33,14 @@ LISTINGS_FEED_URL = os.getenv("LISTINGS_FEED_URL", "").strip()
 TON_COLLECTIONS = [c.strip() for c in os.getenv("TON_COLLECTIONS", "").split(",") if c.strip()]
 
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
-SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "1440"))  # сутки по умолчанию, чтобы не сыпало старьём
+SCAN_LOOKBACK_MIN = int(os.getenv("SCAN_LOOKBACK_MIN", "1440"))  # 24h
 SCAN_PUSH_LIMIT = int(os.getenv("SCAN_PUSH_LIMIT", "5"))
+SCAN_COLD_START_SKIP_SEND = (os.getenv("SCAN_COLD_START_SKIP_SEND", "true").lower() == "true")
 
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "347552741"))
+
+# внутренний флаг «первый проход»
+_COLD_START = True
 
 # ======== Клавиатура ========
 def main_kb() -> ReplyKeyboardMarkup:
@@ -68,7 +72,7 @@ def build_tonhub_link(address: str, amount_ton: Decimal, comment: str) -> str:
 
 MIN_PAYMENT_TON = Decimal(os.getenv("MIN_PAYMENT_TON", "0.1"))
 
-# ======== Команды общего назначения ========
+# ======== Общие команды ========
 async def start_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer(
         "NFT Бот: сканер выгодных лотов и витрина коллекции.\n"
@@ -143,7 +147,7 @@ def _item_discount(it: Dict[str, Any]) -> Optional[float]:
     return None
 
 def _deal_id(it: Dict[str, Any]) -> str:
-    raw = f"{it.get('collection','')}|{it.get('name','')}|{it.get('url','')}|{it.get('price_ton','')}|{it.get('nft_address','')}"
+    raw = f"{it.get('collection','')}|{it.get('nft_address','')}|{it.get('price_ton','')}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
@@ -157,7 +161,7 @@ def _item_matches(it: Dict[str, Any], st: Dict[str, Any]) -> bool:
         except Exception:
             pass
     # скидка
-    disc = _item_discount(it)
+    disc = it.get("discount")
     if disc is not None and float(disc) < float(st.get("min_discount") or 0.0):
         return False
     # цена
@@ -181,7 +185,7 @@ def _item_caption(it: Dict[str, Any]) -> str:
     coll = it.get("collection") or "—"
     price = it.get("price_ton")
     floor = it.get("floor_ton")
-    disc = _item_discount(it)
+    disc = it.get("discount")
     url = it.get("url") or "—"
     lines = [f"🔥 {name}", f"Коллекция: {coll}"]
     if price is not None:
@@ -200,11 +204,10 @@ def _item_caption(it: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 async def send_item_alert(bot: Bot, user_id: int, it: Dict[str, Any]):
-    # Кнопки: всегда tonviewer; доп. кнопка Getgems при наличии
     kb = InlineKeyboardMarkup(row_width=2)
     if it.get("url"):
         kb.insert(InlineKeyboardButton("Открыть лот", url=it["url"]))
-    if it.get("gg_url"):  # дополнительная кнопка, если sale с Getgems
+    if it.get("gg_url"):
         kb.insert(InlineKeyboardButton("Открыть на Getgems", url=it["gg_url"]))
     caption = _item_caption(it)
     img = (it.get("image") or "").strip()
@@ -222,6 +225,16 @@ def _tonviewer_url(addr: str) -> str:
 
 def _getgems_url(addr: str) -> str:
     return f"https://getgems.io/nft/{addr}"
+
+def _parse_iso_ts(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    try:
+        # "2024-06-20T12:34:56Z" или без Z
+        s2 = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        return int(datetime.fromisoformat(s2).timestamp())
+    except Exception:
+        return None
 
 async def _fetch_from_json_feed() -> List[Dict[str, Any]]:
     if not LISTINGS_FEED_URL:
@@ -244,6 +257,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     """
     Берём ТОЛЬКО NFT, которые в продаже (есть sale).
     Ссылка всегда tonviewer; кнопку Getgems добавляем, если marketplace = getgems.
+    После fetch считаем локальный floor по каждой коллекции и discount.
     """
     if not TON_COLLECTIONS:
         return []
@@ -251,10 +265,10 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     if getattr(settings, "TONAPI_KEY", None):
         headers["Authorization"] = f"Bearer {settings.TONAPI_KEY}"
 
-    out: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            total_cap = 60
+            total_cap = 120  # общий колпак на одну выборку
             for coll_addr in TON_COLLECTIONS:
                 if total_cap <= 0:
                     break
@@ -264,12 +278,11 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                     continue
                 data = r.json() or {}
                 items = data.get("nft_items") or data.get("items") or []
-                now_ts = int(_now_utc().timestamp())
 
                 for it in items:
                     sale = it.get("sale") or it.get("marketplace")
                     if not isinstance(sale, dict):
-                        continue  # берём только то, что выставлено
+                        continue  # только то, что реально выставлено
 
                     addr = it.get("address") or ""
                     if not addr:
@@ -290,20 +303,25 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
 
                     name = (it.get("metadata") or {}).get("name") or addr
 
+                    # время публикации продажи (если есть)
+                    ts = _parse_iso_ts(sale.get("created_at")) or _parse_iso_ts(it.get("created_at")) \
+                         or int(_now_utc().timestamp())
+
                     # ссылки
-                    url_view = _tonviewer_url(addr)  # универсально и всегда работает
+                    url_view = _tonviewer_url(addr)
                     gg_url = None
                     market_name = (sale.get("marketplace") or {}).get("name") if isinstance(sale.get("marketplace"), dict) else sale.get("market") or sale.get("name")
                     if isinstance(market_name, str) and "getgems" in market_name.lower():
                         gg_url = _getgems_url(addr)
 
-                    out.append({
+                    rows.append({
                         "name": name,
                         "collection": coll_addr,
                         "nft_address": addr,
                         "price_ton": price_ton,
-                        "floor_ton": None,
-                        "timestamp": now_ts,
+                        "floor_ton": None,   # заполним ниже
+                        "discount": None,    # заполним ниже
+                        "timestamp": ts,
                         "url": url_view,
                         "gg_url": gg_url,
                         "image": img,
@@ -311,14 +329,48 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
                     total_cap -= 1
                     if total_cap <= 0:
                         break
-        return out
     except Exception:
         return []
+
+    # Локальный floor по коллекции: минимальная цена >0
+    by_coll: Dict[str, List[float]] = {}
+    for x in rows:
+        p = _safe_decimal(x.get("price_ton"))
+        if p and p > 0:
+            by_coll.setdefault(x["collection"], []).append(float(p))
+
+    floors: Dict[str, float] = {c: min(v) for c, v in by_coll.items() if v}
+
+    for x in rows:
+        floor = floors.get(x["collection"])
+        if floor:
+            x["floor_ton"] = floor
+            # скидка (если текущая цена ниже floor, будет >0)
+            try:
+                if x.get("price_ton") and floor > 0:
+                    x["discount"] = float((floor - float(x["price_ton"])) / floor * 100.0)
+            except Exception:
+                pass
+
+    return rows
 
 async def fetch_listings() -> List[Dict[str, Any]]:
     if SOURCE_DRIVER == "tonapi":
         return await _fetch_from_tonapi()
     return await _fetch_from_json_feed()
+
+# ======== Отбор и сортировка ========
+def _rank_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # сортируем по скидке (None в конец), затем по цене (дешевле выше)
+    def key(it):
+        disc = it.get("discount")
+        # None -> -inf, чтобы улетело вниз
+        disc_key = -9999.0 if disc is None else float(disc)
+        price = it.get("price_ton")
+        price_key = 9999999.0 if price is None else float(price)
+        # хотим скидку по убыванию → используем отрицательное
+        return (-disc_key, price_key)
+    return sorted(items, key=key)
 
 # ======== Быстрый скан ========
 async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_items: int = 3) -> int:
@@ -328,17 +380,16 @@ async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_it
         return 0
 
     st = await get_or_create_scanner_settings(pool, user_id)
-    sent = 0
-    for it in items:
-        it = dict(it)
-        it["discount"] = _item_discount(it)
-        it["deal_id"] = _deal_id(it)
+    # фильтруем по правилам и сортируем по выгоде
+    cand = [it for it in items if _item_matches(it, st)]
+    cand = _rank_items(cand)
 
-        if not _item_matches(it, st):
-            continue
+    sent = 0
+    for it in cand:
+        it = dict(it)
+        it["deal_id"] = _deal_id(it)
         if await was_deal_seen(pool, it["deal_id"]):
             continue
-
         await send_item_alert(bot, user_id, it)
         await mark_deal_seen(pool, it)
         sent += 1
@@ -351,6 +402,7 @@ async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_it
 
 # ======== Фоновая задача ========
 async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
+    global _COLD_START
     await asyncio.sleep(3)
     while True:
         try:
@@ -362,24 +414,31 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
             if not users:
                 await asyncio.sleep(SCAN_INTERVAL_SEC); continue
 
-            for it in items:
-                it = dict(it)
-                it["discount"] = _item_discount(it)
-                it["deal_id"] = _deal_id(it)
-                if await was_deal_seen(pool, it["deal_id"]):
-                    continue
+            # Для каждого пользователя — свой фильтр и лимит, сортируем по выгоде
+            for uid in users:
+                st = await get_or_create_scanner_settings(pool, uid)
+                cand = [it for it in items if _item_matches(it, st)]
+                cand = _rank_items(cand)
 
-                pushed_for_user: Dict[int, int] = {}
-
-                for uid in users:
-                    if pushed_for_user.get(uid, 0) >= SCAN_PUSH_LIMIT:
+                pushed = 0
+                for it in cand:
+                    it = dict(it)
+                    it["deal_id"] = _deal_id(it)
+                    if await was_deal_seen(pool, it["deal_id"]):
                         continue
-                    st = await get_or_create_scanner_settings(pool, uid)
-                    if _item_matches(it, st):
-                        await send_item_alert(bot, uid, it)
-                        pushed_for_user[uid] = pushed_for_user.get(uid, 0) + 1
 
-                await mark_deal_seen(pool, it)
+                    if _COLD_START and SCAN_COLD_START_SKIP_SEND:
+                        # только помечаем, чтобы не устроить «лавину» после деплоя
+                        await mark_deal_seen(pool, it)
+                        continue
+
+                    await send_item_alert(bot, uid, it)
+                    await mark_deal_seen(pool, it)
+                    pushed += 1
+                    if pushed >= SCAN_PUSH_LIMIT:
+                        break
+
+            _COLD_START = False  # после первого цикла можно слать
 
             await asyncio.sleep(SCAN_INTERVAL_SEC)
         except Exception:
@@ -392,10 +451,11 @@ def _settings_text(st: Dict[str, Any]) -> str:
     cols = st["collections"]
     max_price_text = "нет" if max_price is None else f"{float(max_price):.3f} TON"
     cols_text = "любой" if not cols else ", ".join(cols)
-    src = "TonAPI (только лоты в продаже, ссылки — tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
+    src = "TonAPI (только в продаже, сортировка по скидке, ссылки — tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
     return (
         f"Источник: {src}\n"
-        f"Лимит рассылки за цикл: {SCAN_PUSH_LIMIT}\n\n"
+        f"Лимит рассылки за цикл: {SCAN_PUSH_LIMIT}\n"
+        f"Холодный старт: {'skip' if SCAN_COLD_START_SKIP_SEND else 'send'}\n\n"
         "Текущие фильтры сканера:\n"
         f"— Мин. скидка: {min_disc:.1f}%\n"
         f"— Макс. цена: {max_price_text}\n"
@@ -519,13 +579,16 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
         await m.answer("Фид пуст или недоступен (настрой источник).")
         return
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
+    cand = _rank_items([it for it in items if _item_matches(it, st)])
     sent = 0
-    for it in items[:50]:
-        if _item_matches(it, st):
-            await send_item_alert(bot, m.from_user.id, it)
-            sent += 1
-            if sent >= 5:
-                break
+    for it in cand[:5]:
+        it = dict(it)
+        it["deal_id"] = _deal_id(it)
+        if await was_deal_seen(pool, it["deal_id"]):
+            continue
+        await send_item_alert(bot, m.from_user.id, it)
+        await mark_deal_seen(pool, it)
+        sent += 1
     if sent == 0:
         await m.answer("Сейчас подходящих лотов нет.")
     else:
@@ -534,14 +597,15 @@ async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
 # ======== Диагностика ========
 async def scanner_source_handler(m: types.Message):
     if SOURCE_DRIVER == "tonapi":
-        src = f"TonAPI (только в продаже, ссылки — tonviewer) / коллекций: {len(TON_COLLECTIONS)} / лимит рассылки: {SCAN_PUSH_LIMIT}"
+        src = f"TonAPI (в продаже, сорт. по скидке, tonviewer) / коллекций: {len(TON_COLLECTIONS)} / лимит: {SCAN_PUSH_LIMIT}"
     else:
         src = LISTINGS_FEED_URL or "— не задан —"
     await m.answer(
         "Источник фида:\n"
         f"{src}\n\n"
         f"Интервал скана: {SCAN_INTERVAL_SEC} сек\n"
-        f"Окно свежести: {SCAN_LOOKBACK_MIN} мин"
+        f"Окно свежести: {SCAN_LOOKBACK_MIN} мин\n"
+        f"Холодный старт: {'skip' if SCAN_COLD_START_SKIP_SEND else 'send'}"
     )
 
 async def scanner_ping_handler(m: types.Message):
