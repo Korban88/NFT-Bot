@@ -1,4 +1,4 @@
-# scanner.py
+м# scanner.py
 import asyncio
 import hashlib
 import logging
@@ -21,15 +21,18 @@ logger = logging.getLogger("nftbot.scanner")
 # === Настройки источников ===
 DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
 
-# TonAPI (агрегатор маркетов TON). Нужен токен.
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io")
-TONAPI_TOKEN = getattr(settings, "TONAPI_TOKEN", None) or os.getenv("TONAPI_TOKEN")
+# >>> Поддержка и TONAPI_TOKEN, и TONAPI_KEY (в settings и в переменных окружения)
+TONAPI_TOKEN = (
+    getattr(settings, "TONAPI_TOKEN", None)
+    or getattr(settings, "TONAPI_KEY", None)
+    or os.getenv("TONAPI_TOKEN")
+    or os.getenv("TONAPI_KEY")
+)
 
-# Getgems GraphQL (публичный, но схема может меняться — обрабатываем мягко).
 GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "1") == "1"
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 
-# Сколько сигналов максимум отправлять одному юзеру за один тик
 MAX_DEALS_PER_USER = int(os.getenv("SCANNER_MAX_DEALS_PER_USER", "3"))
 
 
@@ -54,7 +57,6 @@ def _hash_deal(deal: Dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def _calc_discount_pct(deal: Dict[str, Any]) -> float:
-    """Если есть fair/floor — считаем скидку, иначе используем уже проставленную."""
     fair = deal.get("fair_price_ton") or deal.get("floor_price_ton")
     try:
         fair = float(fair) if fair is not None else None
@@ -69,14 +71,11 @@ def _calc_discount_pct(deal: Dict[str, Any]) -> float:
     return float(deal.get("discount_pct") or 0.0)
 
 def _passes_filters_with_reason(deal: Dict[str, Any], st: Dict[str, Any]) -> Tuple[bool, str]:
-    """Возвращаем True/False и причину отсева (для лога)."""
-    # Порог скидки
     min_disc = float(st.get("min_discount_pct") or st.get("min_discount") or 0)
     disc = _calc_discount_pct(deal)
     if disc + 1e-9 < min_disc:
         return False, f"discount {disc:.1f}% < {min_disc:.0f}%"
 
-    # Цена
     try:
         p = float(deal.get("price_ton") or 0.0)
     except Exception:
@@ -96,7 +95,6 @@ def _passes_filters_with_reason(deal: Dict[str, Any], st: Dict[str, Any]) -> Tup
         except Exception:
             pass
 
-    # Коллекции
     cols = st.get("collections") or []
     if cols:
         col = str(deal.get("collection") or deal.get("collection_address") or "").lower()
@@ -129,14 +127,9 @@ def _format_deal_msg(deal: Dict[str, Any]) -> str:
 
 
 # ============ Источники ============
-
 async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
-    """
-    TonAPI: пытаемся получить список активных ордеров.
-    Если токен не задан — возвращаем [].
-    """
     if not TONAPI_TOKEN:
-        logger.debug("TONAPI_TOKEN не задан — TonAPI пропускаем.")
+        logger.debug("TONAPI_TOKEN/TONAPI_KEY не задан — TonAPI пропускаем.")
         return []
 
     url_candidates = [
@@ -195,10 +188,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
 
 
 async def _fetch_from_getgems() -> List[Dict[str, Any]]:
-    """
-    Getgems GraphQL: пробуем получить активные ордера.
-    Схема у Getgems меняется, поэтому парсим осторожно и логируем ответ.
-    """
     if not GETGEMS_ENABLED:
         return []
 
@@ -259,18 +248,15 @@ async def _fetch_from_getgems() -> List[Dict[str, Any]]:
 
 
 async def _fetch_all_sources() -> List[Dict[str, Any]]:
-    """Грузим с нескольких источников и мержим (по (market,id,nft_address,price))."""
-    sources: List[List[Dict[str, Any]]] = []
-
     tonapi_items = await _fetch_from_tonapi()
+    getgems_items = await _fetch_from_getgems()
+
+    sources: List[List[Dict[str, Any]]] = []
     if tonapi_items:
         sources.append(tonapi_items)
-
-    getgems_items = await _fetch_from_getgems()
     if getgems_items:
         sources.append(getgems_items)
 
-    # Мёрджим
     seen = set()
     out: List[Dict[str, Any]] = []
     for arr in sources:
@@ -296,7 +282,6 @@ async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
             if await was_deal_seen(deal_hash):
                 continue
         except Exception:
-            # Если БД недоступна — всё равно пробуем слать, но без дедупа
             pass
 
         msg = _format_deal_msg(d)
@@ -321,7 +306,6 @@ async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
 
 
 async def scanner_tick(bot: Bot):
-    # 1) пользователи
     try:
         users = await get_scanner_users()
     except Exception as e:
@@ -332,13 +316,11 @@ async def scanner_tick(bot: Bot):
         logger.debug("Нет включённых пользователей — тик пропущен.")
         return
 
-    # 2) загрузка ордеров
     all_deals = await _fetch_all_sources()
     if not all_deals:
         logger.info("Источники вернули пусто — сигналов нет на этом тике.")
         return
 
-    # 3) по пользователям — фильтр + лог причин отсева
     for u in users:
         user_id = _safe_user_id(u)
         if not user_id:
