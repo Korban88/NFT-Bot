@@ -1,24 +1,28 @@
 # handlers.py
 import asyncio
-import os
 import hashlib
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import List, Dict, Any, Optional  # важно: чтобы не было NameError
+from typing import Any, Dict, List, Optional  # важно для аннотаций
 
-import httpx
 from aiogram import Dispatcher, types
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 
 from config import settings
 from db import (
-    get_pool, set_wallet, get_wallet,
-    get_or_create_scanner_settings, update_scanner_settings,
-    set_scanner_enabled, get_scanner_users,
-    was_deal_seen, mark_deal_seen
+    get_pool,
+    get_or_create_scanner_settings,
+    get_scanner_users,
+    get_wallet,
+    mark_deal_seen,
+    set_scanner_enabled,
+    set_wallet,
+    update_scanner_settings,
+    was_deal_seen,
 )
 
 # ------------------------------------------------------------
@@ -54,8 +58,8 @@ def _format_scanner_settings(st: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-async def _ensure_user_settings(user_id: int) -> Dict[str, Any]:
-    st = await get_or_create_scanner_settings(user_id)
+async def _ensure_user_settings(pool, user_id: int) -> Dict[str, Any]:
+    st = await get_or_create_scanner_settings(pool, user_id)
     # Значения по умолчанию
     st.setdefault("enabled", False)
     st.setdefault("min_discount_pct", 20)
@@ -79,9 +83,10 @@ async def cmd_start(message: types.Message):
 
 
 async def cmd_status(message: types.Message):
+    pool = await get_pool()
     user_id = message.from_user.id
-    st = await _ensure_user_settings(user_id)
-    wallet = await get_wallet(user_id)
+    st = await _ensure_user_settings(pool, user_id)
+    wallet = await get_wallet(pool, user_id)
     wallet_str = wallet or "не привязан"
     text = (
         f"👤 Пользователь: {user_id}\n"
@@ -92,7 +97,8 @@ async def cmd_status(message: types.Message):
 
 
 async def cmd_wallet(message: types.Message):
-    wallet = await get_wallet(message.from_user.id)
+    pool = await get_pool()
+    wallet = await get_wallet(pool, message.from_user.id)
     if wallet:
         await message.answer(
             f"Текущий TON-адрес: <code>{wallet}</code>\n"
@@ -113,8 +119,8 @@ async def on_plain_address(message: types.Message):
         return  # игнорим, пусть ловят другие хэндлеры
     if not any(ch.isalnum() for ch in text):
         return
-    # Сохраняем как есть (адреса бывают raw/friendly)
-    await set_wallet(message.from_user.id, text)
+    pool = await get_pool()
+    await set_wallet(pool, message.from_user.id, text)
     await message.answer(
         f"Сохранил TON-адрес: <code>{text}</code>",
         reply_markup=_main_reply_kb(),
@@ -122,8 +128,9 @@ async def on_plain_address(message: types.Message):
 
 
 async def cmd_scanner_settings(message: types.Message):
+    pool = await get_pool()
     user_id = message.from_user.id
-    st = await _ensure_user_settings(user_id)
+    st = await _ensure_user_settings(pool, user_id)
 
     kb = InlineKeyboardMarkup()
     kb.add(
@@ -153,8 +160,9 @@ async def cmd_scanner_settings(message: types.Message):
 
 
 async def cb_settings(call: types.CallbackQuery):
+    pool = await get_pool()
     user_id = call.from_user.id
-    st = await _ensure_user_settings(user_id)
+    st = await _ensure_user_settings(pool, user_id)
     data = call.data or ""
 
     try:
@@ -163,7 +171,7 @@ async def cb_settings(call: types.CallbackQuery):
             cur = int(st.get("min_discount_pct") or 0)
             cur = max(0, min(90, cur + delta))
             st["min_discount_pct"] = cur
-            await update_scanner_settings(user_id, {"min_discount_pct": cur})
+            await update_scanner_settings(pool, user_id, {"min_discount_pct": cur})
 
         elif data.startswith("min_price:"):
             delta = Decimal(data.split(":", 1)[1])
@@ -171,7 +179,7 @@ async def cb_settings(call: types.CallbackQuery):
             cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
             st["min_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, {"min_price_ton": str(cur)})
+            await update_scanner_settings(pool, user_id, {"min_price_ton": str(cur)})
 
         elif data.startswith("max_price:"):
             delta = Decimal(data.split(":", 1)[1])
@@ -179,18 +187,18 @@ async def cb_settings(call: types.CallbackQuery):
             cur = Decimal(str(cur_raw)) if cur_raw is not None else Decimal("0")
             cur = max(Decimal("0"), cur + delta)
             st["max_price_ton"] = str(cur)
-            await update_scanner_settings(user_id, {"max_price_ton": str(cur)})
+            await update_scanner_settings(pool, user_id, {"max_price_ton": str(cur)})
 
         elif data.startswith("poll:"):
             delta = int(data.split(":", 1)[1])
             cur = int(st.get("poll_seconds") or 60)
             cur = max(10, min(3600, cur + delta))
             st["poll_seconds"] = cur
-            await update_scanner_settings(user_id, {"poll_seconds": cur})
+            await update_scanner_settings(pool, user_id, {"poll_seconds": cur})
 
         elif data == "cols:clear":
             st["collections"] = []
-            await update_scanner_settings(user_id, {"collections": []})
+            await update_scanner_settings(pool, user_id, {"collections": []})
 
         await call.answer("Обновлено")
         await call.message.edit_text(
@@ -202,14 +210,16 @@ async def cb_settings(call: types.CallbackQuery):
 
 
 async def cmd_scanner_on(message: types.Message):
+    pool = await get_pool()
     user_id = message.from_user.id
-    await set_scanner_enabled(user_id, True)
+    await set_scanner_enabled(pool, user_id, True)
     await message.answer("Сканер включен ✅", reply_markup=_main_reply_kb())
 
 
 async def cmd_scanner_off(message: types.Message):
+    pool = await get_pool()
     user_id = message.from_user.id
-    await set_scanner_enabled(user_id, False)
+    await set_scanner_enabled(pool, user_id, False)
     await message.answer("Сканер выключен ⏸", reply_markup=_main_reply_kb())
 
 
