@@ -63,7 +63,7 @@ def build_ton_transfer_link(address: str, amount_ton: Decimal, comment: str) -> 
     return f"ton://transfer/{address}?amount={nanotons}&text={safe_comment}"
 
 def build_tonkeeper_link(address: str, amount_ton: Decimal, comment: str) -> str:
-    nanotons = int(amount_ton * TON_DECIMALS)
+    nanotons = int(amount_tон * TON_DECIMALS)
     return f"https://app.tonkeeper.com/transfer/{address}?amount={nanotons}&text={quote(comment)}"
 
 def build_tonhub_link(address: str, amount_ton: Decimal, comment: str) -> str:
@@ -230,7 +230,6 @@ def _parse_iso_ts(s: Optional[str]) -> Optional[int]:
     if not s:
         return None
     try:
-        # "2024-06-20T12:34:56Z" или без Z
         s2 = s.replace("Z", "+00:00") if s.endswith("Z") else s
         return int(datetime.fromisoformat(s2).timestamp())
     except Exception:
@@ -253,6 +252,20 @@ async def _fetch_from_json_feed() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+async def _fetch_collection_items(client: httpx.AsyncClient, coll_addr: str) -> List[Dict[str, Any]]:
+    """Подгружаем предметы коллекции, возвращаем только те, что в продаже; делаем 1 ретрай при 429."""
+    url = f"https://tonapi.io/v2/nfts/collections/{coll_addr}/items?limit=50&offset=0"
+    for attempt in (0, 1):
+        r = await client.get(url)
+        if r.status_code == 200:
+            data = r.json() or {}
+            return data.get("nft_items") or data.get("items") or []
+        if r.status_code == 429 and attempt == 0:
+            await asyncio.sleep(0.9)  # короткий backoff
+            continue
+        return []
+    return []
+
 async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     """
     Берём ТОЛЬКО NFT, которые в продаже (есть sale).
@@ -268,17 +281,11 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-            total_cap = 120  # общий колпак на одну выборку
+            total_cap = 120
             for coll_addr in TON_COLLECTIONS:
                 if total_cap <= 0:
                     break
-                url = f"https://tonapi.io/v2/nfts/collections/{coll_addr}/items?limit=50&offset=0"
-                r = await client.get(url)
-                if r.status_code != 200:
-                    continue
-                data = r.json() or {}
-                items = data.get("nft_items") or data.get("items") or []
-
+                items = await _fetch_collection_items(client, coll_addr)
                 for it in items:
                     sale = it.get("sale") or it.get("marketplace")
                     if not isinstance(sale, dict):
@@ -303,7 +310,7 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
 
                     name = (it.get("metadata") or {}).get("name") or addr
 
-                    # время публикации продажи (если есть)
+                    # время публикации продажи
                     ts = _parse_iso_ts(sale.get("created_at")) or _parse_iso_ts(it.get("created_at")) \
                          or int(_now_utc().timestamp())
 
@@ -345,7 +352,6 @@ async def _fetch_from_tonapi() -> List[Dict[str, Any]]:
         floor = floors.get(x["collection"])
         if floor:
             x["floor_ton"] = floor
-            # скидка (если текущая цена ниже floor, будет >0)
             try:
                 if x.get("price_ton") and floor > 0:
                     x["discount"] = float((floor - float(x["price_ton"])) / floor * 100.0)
@@ -361,14 +367,12 @@ async def fetch_listings() -> List[Dict[str, Any]]:
 
 # ======== Отбор и сортировка ========
 def _rank_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # сортируем по скидке (None в конец), затем по цене (дешевле выше)
+    # сортируем по убыванию скидки, при равной скидке — дешевле вверх
     def key(it):
         disc = it.get("discount")
-        # None -> -inf, чтобы улетело вниз
         disc_key = -9999.0 if disc is None else float(disc)
         price = it.get("price_ton")
         price_key = 9999999.0 if price is None else float(price)
-        # хотим скидку по убыванию → используем отрицательное
         return (-disc_key, price_key)
     return sorted(items, key=key)
 
@@ -380,7 +384,6 @@ async def quick_scan_for_user(bot: Bot, user_id: int, pool: asyncpg.Pool, max_it
         return 0
 
     st = await get_or_create_scanner_settings(pool, user_id)
-    # фильтруем по правилам и сортируем по выгоде
     cand = [it for it in items if _item_matches(it, st)]
     cand = _rank_items(cand)
 
@@ -414,7 +417,6 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
             if not users:
                 await asyncio.sleep(SCAN_INTERVAL_SEC); continue
 
-            # Для каждого пользователя — свой фильтр и лимит, сортируем по выгоде
             for uid in users:
                 st = await get_or_create_scanner_settings(pool, uid)
                 cand = [it for it in items if _item_matches(it, st)]
@@ -428,7 +430,6 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
                         continue
 
                     if _COLD_START and SCAN_COLD_START_SKIP_SEND:
-                        # только помечаем, чтобы не устроить «лавину» после деплоя
                         await mark_deal_seen(pool, it)
                         continue
 
@@ -438,8 +439,7 @@ async def scanner_loop(bot: Bot, pool: asyncpg.Pool):
                     if pushed >= SCAN_PUSH_LIMIT:
                         break
 
-            _COLD_START = False  # после первого цикла можно слать
-
+            _COLD_START = False
             await asyncio.sleep(SCAN_INTERVAL_SEC)
         except Exception:
             await asyncio.sleep(SCAN_INTERVAL_SEC)
@@ -451,7 +451,7 @@ def _settings_text(st: Dict[str, Any]) -> str:
     cols = st["collections"]
     max_price_text = "нет" if max_price is None else f"{float(max_price):.3f} TON"
     cols_text = "любой" if not cols else ", ".join(cols)
-    src = "TonAPI (только в продаже, сортировка по скидке, ссылки — tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
+    src = "TonAPI (в продаже, сорт. по скидке, tonviewer)" if SOURCE_DRIVER == "tonapi" else (LISTINGS_FEED_URL or "JSON-фид не задан")
     return (
         f"Источник: {src}\n"
         f"Лимит рассылки за цикл: {SCAN_PUSH_LIMIT}\n"
@@ -574,20 +574,17 @@ async def set_collections_handler(m: types.Message, pool: asyncpg.Pool):
     await m.answer("Список коллекций обновлён.")
 
 async def scanner_test_handler(m: types.Message, bot: Bot, pool: asyncpg.Pool):
+    """Предпросмотр: ТОП-5 подходящих лотов, БЕЗ антидубликатов."""
     items = await fetch_listings()
     if not items:
         await m.answer("Фид пуст или недоступен (настрой источник).")
         return
     st = await get_or_create_scanner_settings(pool, m.from_user.id)
     cand = _rank_items([it for it in items if _item_matches(it, st)])
+
     sent = 0
     for it in cand[:5]:
-        it = dict(it)
-        it["deal_id"] = _deal_id(it)
-        if await was_deal_seen(pool, it["deal_id"]):
-            continue
         await send_item_alert(bot, m.from_user.id, it)
-        await mark_deal_seen(pool, it)
         sent += 1
     if sent == 0:
         await m.answer("Сейчас подходящих лотов нет.")
