@@ -13,7 +13,7 @@ from aiogram import Bot
 from db import (
     get_scanner_users,               # () -> List[int]
     get_or_create_scanner_settings,  # (user_id) -> Dict
-    was_deal_seen,                   # (deal_id) -> bool
+    was_deal_seen,                   # (deal_id, url=None) -> bool
     mark_deal_seen,                  # (deal_dict) -> None
 )
 
@@ -164,7 +164,6 @@ def _passes_user_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
             return True
 
 async def _notify_user(bot: Bot, user_id: int, deal: Dict[str, Any]):
-    """Отправляем сообщение с использованием *общего* экземпляра Bot."""
     parts = ["🧩 <b>Сигнал (dTON)</b>"]
     if deal.get("name"):
         parts.append(f"• NFT: <code>{deal['name']}</code>")
@@ -177,7 +176,6 @@ async def _notify_user(bot: Bot, user_id: int, deal: Dict[str, Any]):
     if deal.get("url"):
         parts.append(f"\n➡️ <a href=\"{deal['url']}\">Открыть в Tonviewer</a>")
     text = "\n".join(parts)
-
     await bot.send_message(user_id, text, disable_web_page_preview=True)
 
 # ===== ОДИН ТИК СКАНЕРА =====
@@ -223,8 +221,8 @@ async def _scan_once(bot: Optional[Bot]) -> None:
 
     # 3) фильтрация и отправка
     for deal in uniq.values():
-        # антидубликаты на уровне БД
-        if await was_deal_seen(deal["deal_id"]):
+        # антидубликаты (по deal_id и url)
+        if await was_deal_seen(deal["deal_id"], deal.get("url")):
             continue
 
         for uid in users:
@@ -236,7 +234,7 @@ async def _scan_once(bot: Optional[Bot]) -> None:
                     except Exception as e:
                         log.warning("Send to %s failed: %s", uid, e)
 
-        # помечаем как отправленное
+        # помечаем в журнале найденных (игнорируем конфликты на уровне БД)
         await mark_deal_seen(deal)
 
 # ===== ЦИКЛ =====
@@ -244,7 +242,6 @@ async def _scan_once(bot: Optional[Bot]) -> None:
 async def scanner_loop():
     log.info("Scanner loop started")
 
-    # создаём один общий Bot и переиспользуем — без закрытия session каждый раз
     token = os.getenv("BOT_TOKEN", "")
     bot: Optional[Bot] = Bot(token, parse_mode="HTML") if token else None
     if not bot:
