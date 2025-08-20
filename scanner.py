@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import httpx
+from aiogram import Bot
 
 from db import (
     get_scanner_users,               # () -> List[int]
@@ -162,33 +163,26 @@ def _passes_user_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
         except Exception:
             return True
 
-async def _notify_user(user_id: int, deal: Dict[str, Any]):
-    from aiogram import Bot
-    TOKEN = os.getenv("BOT_TOKEN", "")
-    if not TOKEN:
-        return
-    bot = Bot(TOKEN, parse_mode="HTML")
-    try:
-        parts = []
-        parts.append(f"🧩 <b>Сигнал (dTON)</b>")
-        if deal.get("name"):
-            parts.append(f"• NFT: <code>{deal['name']}</code>")
-        if deal.get("collection"):
-            parts.append(f"• Коллекция: <code>{deal['collection']}</code>")
-        if deal.get("price_ton") is not None:
-            parts.append(f"• Цена: <b>{deal['price_ton']:.4f} TON</b>")
-        if deal.get("discount") is not None:
-            parts.append(f"• Скидка: <b>{deal['discount']:.1f}%</b>")
-        if deal.get("url"):
-            parts.append(f"\n➡️ <a href=\"{deal['url']}\">Открыть в Tonviewer</a>")
-        text = "\n".join(parts)
-        await bot.send_message(user_id, text, disable_web_page_preview=True)
-    finally:
-        await bot.session.close()
+async def _notify_user(bot: Bot, user_id: int, deal: Dict[str, Any]):
+    """Отправляем сообщение с использованием *общего* экземпляра Bot."""
+    parts = ["🧩 <b>Сигнал (dTON)</b>"]
+    if deal.get("name"):
+        parts.append(f"• NFT: <code>{deal['name']}</code>")
+    if deal.get("collection"):
+        parts.append(f"• Коллекция: <code>{deal['collection']}</code>")
+    if deal.get("price_ton") is not None:
+        parts.append(f"• Цена: <b>{deal['price_ton']:.4f} TON</b>")
+    if deal.get("discount") is not None:
+        parts.append(f"• Скидка: <b>{deal['discount']:.1f}%</b>")
+    if deal.get("url"):
+        parts.append(f"\n➡️ <a href=\"{deal['url']}\">Открыть в Tonviewer</a>")
+    text = "\n".join(parts)
+
+    await bot.send_message(user_id, text, disable_web_page_preview=True)
 
 # ===== ОДИН ТИК СКАНЕРА =====
 
-async def _scan_once() -> None:
+async def _scan_once(bot: Optional[Bot]) -> None:
     # 1) собрать сделки
     batches: List[List[Dict[str, Any]]] = []
     try:
@@ -236,7 +230,11 @@ async def _scan_once() -> None:
         for uid in users:
             st = await get_or_create_scanner_settings(uid)
             if _passes_user_filters(deal, st):
-                await _notify_user(uid, deal)
+                if bot:
+                    try:
+                        await _notify_user(bot, uid, deal)
+                    except Exception as e:
+                        log.warning("Send to %s failed: %s", uid, e)
 
         # помечаем как отправленное
         await mark_deal_seen(deal)
@@ -245,9 +243,16 @@ async def _scan_once() -> None:
 
 async def scanner_loop():
     log.info("Scanner loop started")
+
+    # создаём один общий Bot и переиспользуем — без закрытия session каждый раз
+    token = os.getenv("BOT_TOKEN", "")
+    bot: Optional[Bot] = Bot(token, parse_mode="HTML") if token else None
+    if not bot:
+        log.warning("BOT_TOKEN не задан — уведомления отправляться не будут.")
+
     while True:
         try:
-            await _scan_once()
+            await _scan_once(bot)
         except Exception as e:
             log.exception("scanner tick failed: %s", e)
         await asyncio.sleep(POLL_SECONDS)
