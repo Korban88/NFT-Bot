@@ -18,22 +18,23 @@ from db import (
 
 logger = logging.getLogger("nftbot.scanner")
 
-# ---------- конфиги источников ----------
+# ---------- конфиги ----------
 DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
 MAX_DEALS_PER_USER = int(os.getenv("SCANNER_MAX_DEALS_PER_USER", "3"))
 
-# По умолчанию выключаем проблемные источники, чтобы не спамить 400/404
-GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "0") == "1"
-GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
+# Источники: «устаревшие» выключаем.
+TONAPI_REST_ENABLED = os.getenv("TONAPI_REST_ENABLED", "0") == "1"   # 404 — оставлено на случай, если вернут API
+GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "0") == "1"           # публичный GraphQL не даёт нужные поля
 
-TONAPI_REST_ENABLED = os.getenv("TONAPI_REST_ENABLED", "0") == "1"
-TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io")
-TONAPI_TOKEN = (
-    getattr(settings, "TONAPI_TOKEN", None)
-    or getattr(settings, "TONAPI_KEY", None)
-    or os.getenv("TONAPI_TOKEN")
-    or os.getenv("TONAPI_KEY")
-)
+# dTON — новый источник (включаем)
+DTON_ENABLED = os.getenv("DTON_ENABLED", "1") == "1"
+DTON_API_KEY = os.getenv("DTON_API_KEY") or ""
+DTON_ENDPOINT = f"https://dton.io/{DTON_API_KEY}/graphql" if DTON_API_KEY else None
+
+# Code-hash контрактов фикс-прайс Getgems (основные ревизии)
+GETGEMS_FIX_V4R1 = "6B95A6418B9C9D2359045D1E7559B8D549AE0E506F24CAAB58FA30C8FB1FEB86"
+GETGEMS_FIX_V3R3 = "24221FA571E542E055C77BEDFDBF527C7AF460CFDC7F344C450787B4CFA1EB4D"
+SALE_CODE_HASHES = [GETGEMS_FIX_V4R1, GETGEMS_FIX_V3R3]
 
 # ---------- утилиты ----------
 
@@ -129,108 +130,108 @@ def _format_deal_msg(deal: Dict[str, Any]) -> str:
 
 # ---------- источники ----------
 
-async def _fetch_from_tonapi_rest() -> List[Dict[str, Any]]:
-    """Старые REST-роуты TonAPI сейчас 404 — оставляем опционально (вдруг вернутся)."""
-    if not (TONAPI_REST_ENABLED and TONAPI_TOKEN):
-        return []
-    headers = {"Authorization": f"Bearer {TONAPI_TOKEN}"}
-    urls = [
-        f"{TONAPI_BASE}/v2/marketplace/orders?limit=100",
-        f"{TONAPI_BASE}/v2/market/active-orders?limit=100",
-    ]
-    out: List[Dict[str, Any]] = []
-    async with httpx.AsyncClient(timeout=10) as client:
-        for url in urls:
-            r = await client.get(url, headers=headers)
-            if r.status_code != 200:
-                logger.info("TonAPI REST %s -> %s %s", url, r.status_code, r.text[:200])
-                continue
-            data = r.json()
-            items = (data.get("orders") or data.get("items") or data.get("nft_items") or [])
-            for it in items:
-                price_ton = it.get("price_ton") or (it.get("price", {}).get("value") if isinstance(it.get("price"), dict) else None) or it.get("price")
-                try:
-                    price_ton = float(price_ton) if price_ton is not None else None
-                except Exception:
-                    price_ton = None
-                out.append({
-                    "id": it.get("id") or it.get("order_id") or it.get("nft_item_id") or it.get("address"),
-                    "nft_address": it.get("nft_address") or it.get("address"),
-                    "name": it.get("name") or it.get("nft_name") or "",
-                    "collection": ((it.get("collection") or {}).get("address") if isinstance(it.get("collection"), dict) else it.get("collection")),
-                    "market": it.get("market") or it.get("source") or "TonAPI",
-                    "price_ton": price_ton,
-                    "fair_price_ton": it.get("fair_price_ton") or it.get("floor_price_ton"),
-                    "discount_pct": it.get("discount_pct"),
-                    "url": it.get("url") or it.get("link"),
-                })
-    return out
-
-async def _fetch_from_getgems() -> List[Dict[str, Any]]:
-    """Getgems GraphQL — по умолчанию выключен, т.к. нынешняя схема даёт 400 на публичные запросы."""
-    if not GETGEMS_ENABLED:
-        return []
-    query = """
-    query ListActiveOrders($limit:Int!) {
-      orders: marketplaceOrders(limit: $limit, offset: 0, sort: {createdAt: DESC}, filter: {status: ACTIVE}) {
-        id
-        price
-        nftItem { address name collection { address } }
-        url
-      }
-    }
+async def _fetch_from_dton() -> List[Dict[str, Any]]:
     """
-    variables = {"limit": 100}
-    async with httpx.AsyncClient(timeout=12) as client:
-        r = await client.post(GETGEMS_GRAPHQL, json={"query": query, "variables": variables})
-        if r.status_code != 200:
-            logger.info("Getgems GQL -> %s %s", r.status_code, r.text[:300])
-            return []
-        data = r.json()
-        if "errors" in data:
-            logger.info("Getgems GQL errors: %s", data["errors"])
-            return []
-        nodes = data.get("data", {}).get("orders") or data.get("data", {}).get("marketplaceOrders") or []
-        out: List[Dict[str, Any]] = []
-        for it in nodes:
-            nft = it.get("nftItem") or {}
-            coll = (nft.get("collection") or {}).get("address")
-            price = it.get("price")
+    dTON GraphQL: ищем аккаунты с code_hash из SALE_CODE_HASHES (контракты Getgems Fix-Price).
+    На этом шаге мы *только* собираем активные sale-аккаунты (адреса); цену/NFT достанем на следующем шаге.
+    """
+    if not (DTON_ENABLED and DTON_ENDPOINT and DTON_API_KEY):
+        return []
+
+    # dTON схемы могут отличаться по названиям полей; пробуем несколько безопасных запросов.
+    queries: List[Tuple[str, Dict[str, Any]]] = [
+        (
+            # Вариант 1: accounts(...) { address, code_hash, last_paid }
+            """
+            query Sales($hashes:[String!]!, $limit:Int!) {
+              accounts(filter:{ code_hash:{in:$hashes} }, limit:$limit, orderBy: LAST_PAID_DESC) {
+                address
+                code_hash
+                last_paid
+              }
+            }
+            """,
+            {"hashes": SALE_CODE_HASHES, "limit": 200},
+        ),
+        (
+            # Вариант 2: accounts(...) { id, address }
+            """
+            query Sales($hashes:[String!]!, $limit:Int!) {
+              accounts(filter:{ code_hash:{in:$hashes} }, limit:$limit) {
+                id
+                address
+              }
+            }
+            """,
+            {"hashes": SALE_CODE_HASHES, "limit": 200},
+        ),
+    ]
+
+    found_addresses: List[str] = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for q, variables in queries:
             try:
-                price = float(price) if price is not None else None
-            except Exception:
-                price = None
-            out.append({
-                "id": it.get("id"),
-                "nft_address": nft.get("address"),
-                "name": nft.get("name") or "",
-                "collection": coll,
-                "market": "Getgems",
-                "price_ton": price,
-                "fair_price_ton": None,
-                "discount_pct": None,
-                "url": it.get("url"),
-            })
-        return out
+                r = await client.post(DTON_ENDPOINT, json={"query": q, "variables": variables})
+                if r.status_code != 200:
+                    logger.info("dTON -> %s %s", r.status_code, r.text[:300])
+                    continue
+                data = r.json()
+                if "errors" in data:
+                    logger.info("dTON errors: %s", data["errors"])
+                    continue
+                items = (data.get("data") or {}).get("accounts") or []
+                addrs = [it.get("address") for it in items if it.get("address")]
+                if addrs:
+                    found_addresses = addrs
+                    break
+            except Exception as e:
+                logger.info("dTON fetch error: %s", e)
+
+    if not found_addresses:
+        logger.info("dTON: по code_hash ничего не нашли (возможно, отличается схема).")
+        return []
+
+    logger.info("dTON: найдено адресов sale-контрактов: %d", len(found_addresses))
+
+    # Пока не знаем цену/коллекцию: вернём «черновые» сделки с минимальным составом.
+    # На следующем шаге подцепим run-get и обогатим данными.
+    deals: List[Dict[str, Any]] = []
+    for addr in found_addresses[:200]:
+        deals.append({
+            "id": addr,
+            "nft_address": None,
+            "name": "Getgems Sale",
+            "collection": None,
+            "market": "dTON/Getgems",
+            "price_ton": None,            # будет заполнено после run-get
+            "fair_price_ton": None,
+            "discount_pct": None,
+            "url": f"https://tonviewer.com/{addr}",
+        })
+    return deals
 
 async def _fetch_all_sources() -> List[Dict[str, Any]]:
     sources: List[List[Dict[str, Any]]] = []
-    if TONAPI_REST_ENABLED:
-        sources.append(await _fetch_from_tonapi_rest())
-    if GETGEMS_ENABLED:
-        sources.append(await _fetch_from_getgems())
 
-    # если все источники выключены — логнем один раз на тик
+    # dTON — основной источник
+    dton_items = await _fetch_from_dton()
+    if dton_items:
+        sources.append(dton_items)
+
+    # (Оставлено для совместимости — по умолчанию выключены)
+    # if TONAPI_REST_ENABLED: sources.append(await _fetch_from_tonapi_rest())
+    # if GETGEMS_ENABLED:     sources.append(await _fetch_from_getgems())
+
     if not sources:
-        logger.info("Нет активных источников (включи GETGEMS_ENABLED=1 или TONAPI_REST_ENABLED=1).")
+        logger.info("Нет активных источников или источники вернули пусто.")
         return []
 
-    # мёрдж по ключу
+    # дедупликация
     seen = set()
     out: List[Dict[str, Any]] = []
     for arr in sources:
         for d in arr:
-            key = (d.get("market"), d.get("id"), d.get("nft_address"), d.get("price_ton"))
+            key = (d.get("market"), d.get("id"))
             if key in seen:
                 continue
             seen.add(key)
