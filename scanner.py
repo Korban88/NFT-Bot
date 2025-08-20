@@ -22,7 +22,7 @@ log = logging.getLogger("nftbot.scanner")
 # ===== ENV =====
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 
-# источники
+# источники (TonAPI REST / Getgems оставлены выключенными)
 GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "0") == "1"
 TONAPI_REST_ENABLED = os.getenv("TONAPI_REST_ENABLED", "0") == "1"
 
@@ -32,9 +32,6 @@ DTON_API_KEY = os.getenv("DTON_API_KEY", "")
 DTON_BASE = os.getenv("DTON_BASE", "https://dton.io").rstrip("/")
 DTON_PAGE_SIZE = int(os.getenv("DTON_PAGE_SIZE", "50"))
 DTON_LOOKBACK_MIN = int(os.getenv("DTON_LOOKBACK_MIN", "60"))
-
-TONAPI_KEY = os.getenv("TONAPI_KEY") or os.getenv("TONAPI_TOKEN") or ""
-HEADERS_TONAPI = {"Authorization": f"Bearer {TONAPI_KEY}"} if TONAPI_KEY else {}
 
 # ===== УТИЛИТЫ =====
 
@@ -50,13 +47,10 @@ def _as_ton(nano: Optional[int]) -> Optional[float]:
     except Exception:
         return None
 
-# ===== dTON =====
+# ===== dTON: закрытые продажи за последний интервал =====
 
 async def _fetch_from_dton() -> List[Dict[str, Any]]:
-    if not DTON_ENABLED:
-        return []
-    if not DTON_API_KEY:
-        log.warning("dTON включен, но DTON_API_KEY пуст — пропускаем источник.")
+    if not DTON_ENABLED or not DTON_API_KEY:
         return []
 
     url = f"{DTON_BASE}/{DTON_API_KEY}/graphql"
@@ -80,7 +74,6 @@ async def _fetch_from_dton() -> List[Dict[str, Any]]:
       }
     }
     """
-
     variables = {"gt": since_str, "pageSize": DTON_PAGE_SIZE}
 
     try:
@@ -92,9 +85,8 @@ async def _fetch_from_dton() -> List[Dict[str, Any]]:
         log.warning("dTON: запрос упал: %s", e)
         return []
 
-    errors = (data or {}).get("errors")
-    if errors:
-        log.info("dTON -> ошибки GraphQL: %s", errors)
+    if (data or {}).get("errors"):
+        log.info("dTON -> ошибки GraphQL: %s", data["errors"])
         return []
 
     rows = (data or {}).get("data", {}).get("raw_transactions", []) or []
@@ -106,44 +98,40 @@ async def _fetch_from_dton() -> List[Dict[str, Any]]:
         price_ton = _as_ton(price_nano)
         deal_url = f"https://tonviewer.com/{nft_addr}" if nft_addr else None
 
-        deal = {
+        deals.append({
             "deal_id": _deal_id("dton", nft_addr or "", str(price_nano or "")),
             "url": deal_url,
             "collection": col_addr or "",
             "name": nft_addr or "NFT",
             "price_ton": price_ton,
-            "floor_ton": None,
-            "discount": None,
+            "floor_ton": None,     # floor пока не считаем
+            "discount": None,      # скидки нет без floor
             "source": "dton",
-        }
-        deals.append(deal)
-
+        })
     return deals
 
-# ===== заглушки других источников =====
+# ===== заглушки других источников (выкл по умолчанию) =====
 
 async def _fetch_from_tonapi_rest() -> List[Dict[str, Any]]:
-    if not TONAPI_REST_ENABLED:
-        return []
-    return []
+    return [] if not TONAPI_REST_ENABLED else []
 
 async def _fetch_from_getgems() -> List[Dict[str, Any]]:
-    if not GETGEMS_ENABLED:
-        return []
-    return []
+    return [] if not GETGEMS_ENABLED else []
 
 # ===== ФИЛЬТРЫ/НОТИФИКАЦИИ =====
 
 def _passes_user_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
+    """
+    Сейчас отправляем по коллекциям/цене.
+    Для discount — если None, то пропускаем только когда min_discount <= 0.
+    """
     min_discount: Optional[float] = st.get("min_discount")
     max_price_ton = st.get("max_price_ton")
     collections = st.get("collections")
 
     if collections:
-        if not any(
-            (deal.get("collection") or "").lower() == (c or "").lower()
-            for c in collections
-        ):
+        allow = {str(c or "").lower() for c in collections}
+        if (deal.get("collection") or "").lower() not in allow:
             return False
 
     price = deal.get("price_ton")
@@ -157,11 +145,10 @@ def _passes_user_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
     disc = deal.get("discount")
     if disc is None:
         return (min_discount is None) or (float(min_discount) <= 0.0)
-    else:
-        try:
-            return float(disc) >= float(min_discount or 0.0)
-        except Exception:
-            return True
+    try:
+        return float(disc) >= float(min_discount or 0.0)
+    except Exception:
+        return True
 
 async def _notify_user(bot: Bot, user_id: int, deal: Dict[str, Any]):
     parts = ["🧩 <b>Сигнал (dTON)</b>"]
@@ -181,23 +168,20 @@ async def _notify_user(bot: Bot, user_id: int, deal: Dict[str, Any]):
 # ===== ОДИН ТИК СКАНЕРА =====
 
 async def _scan_once(bot: Optional[Bot]) -> None:
-    # 1) собрать сделки
+    # 1) собрать сделки с источников
     batches: List[List[Dict[str, Any]]] = []
     try:
-        dton = await _fetch_from_dton()
-        batches.append(dton)
+        batches.append(await _fetch_from_dton())
     except Exception as e:
         log.warning("dTON fetch failed: %s", e)
 
+    # (оставлено на будущее)
     try:
-        tonapi = await _fetch_from_tonapi_rest()
-        batches.append(tonapi)
+        batches.append(await _fetch_from_tonapi_rest())
     except Exception as e:
         log.warning("TonAPI REST fetch failed: %s", e)
-
     try:
-        gg = await _fetch_from_getgems()
-        batches.append(gg)
+        batches.append(await _fetch_from_getgems())
     except Exception as e:
         log.warning("Getgems fetch failed: %s", e)
 
@@ -211,31 +195,39 @@ async def _scan_once(bot: Optional[Bot]) -> None:
 
     log.info("Суммарно получено %d / уникальных %d ордеров", len(all_items), len(uniq))
     if not uniq:
-        log.info("Нет активных источников или источники вернули пусто.")
         return
 
-    # 2) пользователи
+    # 2) список пользователей
     users = await get_scanner_users()
     if not users:
+        log.info("Нет включённых пользователей — рассылка пропущена.")
         return
+    log.info("Включённых пользователей: %d", len(users))
 
     # 3) фильтрация и отправка
+    sent_total = 0
     for deal in uniq.values():
-        # антидубликаты (по deal_id и url)
+        # Если уже видели этот URL/лот — пропускаем
         if await was_deal_seen(deal["deal_id"], deal.get("url")):
             continue
 
+        delivered_to_any = False
         for uid in users:
             st = await get_or_create_scanner_settings(uid)
             if _passes_user_filters(deal, st):
                 if bot:
                     try:
                         await _notify_user(bot, uid, deal)
+                        delivered_to_any = True
+                        sent_total += 1
                     except Exception as e:
                         log.warning("Send to %s failed: %s", uid, e)
 
-        # помечаем в журнале найденных (игнорируем конфликты на уровне БД)
-        await mark_deal_seen(deal)
+        # ВАЖНО: помечаем в БД только если кому-то отправили
+        if delivered_to_any:
+            await mark_deal_seen(deal)
+
+    log.info("Разослано сообщений: %d", sent_total)
 
 # ===== ЦИКЛ =====
 
