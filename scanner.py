@@ -1,353 +1,283 @@
 # scanner.py
+import os
 import asyncio
 import hashlib
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
 
 import httpx
-from aiogram import Bot
 
-from config import settings
 from db import (
-    get_scanner_users,               # () -> List[int]
-    get_or_create_scanner_settings,  # (user_id) -> Dict
-    was_deal_seen,                   # (deal_id) -> bool
-    mark_deal_seen,                  # (deal_dict) -> None
+    get_pool,
+    get_scanner_users,
+    get_or_create_scanner_settings,
+    was_deal_seen,
+    mark_deal_seen,
 )
 
-logger = logging.getLogger("nftbot.scanner")
+log = logging.getLogger("nftbot.scanner")
 
-# ---------- конфиги ----------
-DEFAULT_TICK_SECONDS = int(os.getenv("SCANNER_TICK_SECONDS", "30"))
-MAX_DEALS_PER_USER = int(os.getenv("SCANNER_MAX_DEALS_PER_USER", "3"))
+# ===== ENV =====
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 
-# Источники: «устаревшие» выключаем.
-TONAPI_REST_ENABLED = os.getenv("TONAPI_REST_ENABLED", "0") == "1"   # 404 — оставлено на случай, если вернут API
-GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "0") == "1"           # публичный GraphQL не даёт нужные поля
+# источники
+GETGEMS_ENABLED = os.getenv("GETGEMS_ENABLED", "0") == "1"
+TONAPI_REST_ENABLED = os.getenv("TONAPI_REST_ENABLED", "0") == "1"
 
-# dTON — новый источник (включаем)
-DTON_ENABLED = os.getenv("DTON_ENABLED", "1") == "1"
-DTON_API_KEY = os.getenv("DTON_API_KEY") or ""
-DTON_ENDPOINT = f"https://dton.io/{DTON_API_KEY}/graphql" if DTON_API_KEY else None
+# dTON
+DTON_ENABLED = os.getenv("DTON_ENABLED", "0") == "1"
+DTON_API_KEY = os.getenv("DTON_API_KEY", "")
+DTON_BASE = os.getenv("DTON_BASE", "https://dton.io").rstrip("/")
+DTON_PAGE_SIZE = int(os.getenv("DTON_PAGE_SIZE", "50"))
+# сколько минут назад смотреть завершённые сделки (dTON raw_transactions)
+DTON_LOOKBACK_MIN = int(os.getenv("DTON_LOOKBACK_MIN", "60"))
 
-# Code-hash контрактов фикс-прайс Getgems (основные ревизии)
-GETGEMS_FIX_V4R1 = "6B95A6418B9C9D2359045D1E7559B8D549AE0E506F24CAAB58FA30C8FB1FEB86"
-GETGEMS_FIX_V3R3 = "24221FA571E542E055C77BEDFDBF527C7AF460CFDC7F344C450787B4CFA1EB4D"
-SALE_CODE_HASHES = [GETGEMS_FIX_V4R1, GETGEMS_FIX_V3R3]
+TONAPI_KEY = os.getenv("TONAPI_KEY") or os.getenv("TONAPI_TOKEN") or ""
+HEADERS_TONAPI = {"Authorization": f"Bearer {TONAPI_KEY}"} if TONAPI_KEY else {}
 
-# ---------- утилиты ----------
+# ===== УТИЛИТЫ =====
 
-def _safe_user_id(item) -> Optional[int]:
-    if isinstance(item, int):
-        return item
-    if isinstance(item, dict):
-        return item.get("user_id") or item.get("id")
-    return None
+def _deal_id(*parts: str) -> str:
+    h = hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
+    return f"deal_{h}"
 
-def _hash_deal(deal: Dict[str, Any]) -> str:
-    raw = (
-        str(deal.get("id"))
-        + "|"
-        + str(deal.get("nft_address"))
-        + "|"
-        + str(deal.get("price_ton"))
-        + "|"
-        + str(deal.get("market"))
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-def _calc_discount_pct(deal: Dict[str, Any]) -> float:
-    fair = deal.get("fair_price_ton") or deal.get("floor_price_ton")
+def _as_ton(nano: Optional[int]) -> Optional[float]:
+    if nano is None:
+        return None
     try:
-        fair = float(fair) if fair is not None else None
+        return float(Decimal(nano) / Decimal(1_000_000_000))
     except Exception:
-        fair = None
-    try:
-        price = float(deal.get("price_ton") or 0.0)
-    except Exception:
-        price = 0.0
-    if fair and fair > 0:
-        return max(0.0, (1.0 - price / fair) * 100.0)
-    return float(deal.get("discount_pct") or 0.0)
+        return None
 
-def _passes_filters_with_reason(deal: Dict[str, Any], st: Dict[str, Any]) -> Tuple[bool, str]:
-    min_disc = float(st.get("min_discount_pct") or st.get("min_discount") or 0)
-    disc = _calc_discount_pct(deal)
-    if disc + 1e-9 < min_disc:
-        return False, f"discount {disc:.1f}% < {min_disc:.0f}%"
-
-    try:
-        p = float(deal.get("price_ton") or 0.0)
-    except Exception:
-        p = 0.0
-
-    min_price = st.get("min_price_ton")
-    if min_price not in (None, ""):
-        try:
-            if p + 1e-9 < float(min_price):
-                return False, f"price {p:.3f} < min {float(min_price):.3f}"
-        except Exception:
-            pass
-
-    max_price = st.get("max_price_ton")
-    if max_price not in (None, ""):
-        try:
-            if p - 1e-9 > float(max_price):
-                return False, f"price {p:.3f} > max {float(max_price):.3f}"
-        except Exception:
-            pass
-
-    cols = st.get("collections") or []
-    if cols:
-        col = str(deal.get("collection") or deal.get("collection_address") or "").lower()
-        if col and col not in {c.lower() for c in cols}:
-            return False, f"collection {col} not in allowlist"
-    return True, "ok"
-
-def _format_deal_msg(deal: Dict[str, Any]) -> str:
-    name = deal.get("name") or deal.get("nft_name") or "NFT"
-    market = deal.get("market") or "market"
-    coll = deal.get("collection") or deal.get("collection_address") or "—"
-    try:
-        price = float(deal.get("price_ton") or 0.0)
-    except Exception:
-        price = 0.0
-    disc = _calc_discount_pct(deal)
-    url = deal.get("url") or deal.get("link") or ""
-
-    lines = [
-        f"🧩 <b>{name}</b>",
-        f"🏷 Рынок: {market}",
-        f"📦 Коллекция: <code>{coll}</code>",
-        f"💰 Цена: <b>{price:.3f} TON</b>",
-    ]
-    if disc > 0:
-        lines.append(f"📉 Скидка: <b>{disc:.0f}%</b>")
-    if url:
-        lines.append(f"\n<a href=\"{url}\">Открыть лот</a>")
-    return "\n".join(lines)
-
-# ---------- источники ----------
+# ===== dTON =====
+# Используем dTON GraphQL:
+# - таблица raw_transactions — завершённые продажи NFT с распарсенными полями цены и коллекции
+# - фильтры: parsed_seller_is_closed=1, account_state_state_init_code_has_get_nft_data=1, gen_utime__gt
+# Источники: docs/статьи dTON с примерами полей parsed_* и фильтров.
 
 async def _fetch_from_dton() -> List[Dict[str, Any]]:
-    """
-    dTON GraphQL: ищем аккаунты с code_hash из SALE_CODE_HASHES (контракты Getgems Fix-Price).
-    На этом шаге мы *только* собираем активные sale-аккаунты (адреса); цену/NFT достанем на следующем шаге.
-    """
-    if not (DTON_ENABLED and DTON_ENDPOINT and DTON_API_KEY):
+    if not DTON_ENABLED:
         return []
 
-    # dTON схемы могут отличаться по названиям полей; пробуем несколько безопасных запросов.
-    queries: List[Tuple[str, Dict[str, Any]]] = [
-        (
-            # Вариант 1: accounts(...) { address, code_hash, last_paid }
-            """
-            query Sales($hashes:[String!]!, $limit:Int!) {
-              accounts(filter:{ code_hash:{in:$hashes} }, limit:$limit, orderBy: LAST_PAID_DESC) {
-                address
-                code_hash
-                last_paid
-              }
-            }
-            """,
-            {"hashes": SALE_CODE_HASHES, "limit": 200},
-        ),
-        (
-            # Вариант 2: accounts(...) { id, address }
-            """
-            query Sales($hashes:[String!]!, $limit:Int!) {
-              accounts(filter:{ code_hash:{in:$hashes} }, limit:$limit) {
-                id
-                address
-              }
-            }
-            """,
-            {"hashes": SALE_CODE_HASHES, "limit": 200},
-        ),
-    ]
-
-    found_addresses: List[str] = []
-    async with httpx.AsyncClient(timeout=15) as client:
-        for q, variables in queries:
-            try:
-                r = await client.post(DTON_ENDPOINT, json={"query": q, "variables": variables})
-                if r.status_code != 200:
-                    logger.info("dTON -> %s %s", r.status_code, r.text[:300])
-                    continue
-                data = r.json()
-                if "errors" in data:
-                    logger.info("dTON errors: %s", data["errors"])
-                    continue
-                items = (data.get("data") or {}).get("accounts") or []
-                addrs = [it.get("address") for it in items if it.get("address")]
-                if addrs:
-                    found_addresses = addrs
-                    break
-            except Exception as e:
-                logger.info("dTON fetch error: %s", e)
-
-    if not found_addresses:
-        logger.info("dTON: по code_hash ничего не нашли (возможно, отличается схема).")
+    if not DTON_API_KEY:
+        log.warning("dTON включен, но DTON_API_KEY пуст — пропускаем источник.")
         return []
 
-    logger.info("dTON: найдено адресов sale-контрактов: %d", len(found_addresses))
+    url = f"{DTON_BASE}/{DTON_API_KEY}/graphql"
 
-    # Пока не знаем цену/коллекцию: вернём «черновые» сделки с минимальным составом.
-    # На следующем шаге подцепим run-get и обогатим данными.
+    # берём сделки за последний интервал
+    since = datetime.now(timezone.utc) - timedelta(minutes=DTON_LOOKBACK_MIN)
+    since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Минимальный безопасный запрос по примерам dTON:
+    # - parsed_seller_is_closed: 1  — завершённые продажи
+    # - account_state_state_init_code_has_get_nft_data: 1 — это точно NFT
+    # - gen_utime__gt — ограничение по времени
+    # Вытаскиваем адрес NFT и коллекции в friendly-виде + цену (в nanoTON).
+    gql = """
+    query FetchClosedNftSales($gt: String!, $pageSize: Int!) {
+      raw_transactions(
+        parsed_seller_is_closed: 1
+        account_state_state_init_code_has_get_nft_data: 1
+        gen_utime__gt: $gt
+        page: 0
+        page_size: $pageSize
+        order_by: "gen_utime"
+        order_desc: true
+      ) {
+        nft_address: address__friendly
+        col_address: parsed_nft_collection_address_address__friendly
+        price: parsed_seller_nft_price
+      }
+    }
+    """
+
+    variables = {
+        "gt": since_str,
+        "pageSize": DTON_PAGE_SIZE,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json={"query": gql, "variables": variables})
+            log.info("HTTP dTON POST %s -> %s", url, r.status_code)
+            data = r.json()
+    except Exception as e:
+        log.warning("dTON: запрос упал: %s", e)
+        return []
+
+    errors = (data or {}).get("errors")
+    if errors:
+        log.info("dTON -> ошибки GraphQL: %s", errors)
+        return []
+
+    rows = (data or {}).get("data", {}).get("raw_transactions", []) or []
     deals: List[Dict[str, Any]] = []
-    for addr in found_addresses[:200]:
-        deals.append({
-            "id": addr,
-            "nft_address": None,
-            "name": "Getgems Sale",
-            "collection": None,
-            "market": "dTON/Getgems",
-            "price_ton": None,            # будет заполнено после run-get
-            "fair_price_ton": None,
-            "discount_pct": None,
-            "url": f"https://tonviewer.com/{addr}",
-        })
+
+    for it in rows:
+        nft_addr = it.get("nft_address")  # friendly адрес NFT
+        col_addr = it.get("col_address")  # friendly адрес коллекции
+        price_nano = it.get("price")
+
+        price_ton = _as_ton(price_nano)
+        deal_url = f"https://tonviewer.com/{nft_addr}" if nft_addr else None
+
+        deal = {
+            "deal_id": _deal_id("dton", nft_addr or "", str(price_nano or "")),
+            "url": deal_url,
+            "collection": col_addr or "",
+            "name": nft_addr or "NFT",
+            "price_ton": price_ton,
+            "floor_ton": None,      # dTON здесь не даёт floor — фильтруем по цене/коллекциям
+            "discount": None,       # скидку не считаем на этом источнике
+            "source": "dton",
+        }
+        deals.append(deal)
+
     return deals
 
-async def _fetch_all_sources() -> List[Dict[str, Any]]:
-    sources: List[List[Dict[str, Any]]] = []
+# ===== (заглушки для прочих источников — оставляем как были/минимальные) =====
 
-    # dTON — основной источник
-    dton_items = await _fetch_from_dton()
-    if dton_items:
-        sources.append(dton_items)
-
-    # (Оставлено для совместимости — по умолчанию выключены)
-    # if TONAPI_REST_ENABLED: sources.append(await _fetch_from_tonapi_rest())
-    # if GETGEMS_ENABLED:     sources.append(await _fetch_from_getgems())
-
-    if not sources:
-        logger.info("Нет активных источников или источники вернули пусто.")
+async def _fetch_from_tonapi_rest() -> List[Dict[str, Any]]:
+    if not TONAPI_REST_ENABLED:
         return []
+    # На текущем этапе TonAPI REST отключён (старые эндпоинты 404).
+    return []
 
-    # дедупликация
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for arr in sources:
-        for d in arr:
-            key = (d.get("market"), d.get("id"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(d)
-    logger.info("Суммарно получено %s / уникальных %s ордеров", sum(len(a) for a in sources), len(out))
-    return out
+async def _fetch_from_getgems() -> List[Dict[str, Any]]:
+    if not GETGEMS_ENABLED:
+        return []
+    # Мы отключили Getgems GraphQL — схема изменилась и старые поля недоступны.
+    return []
 
-# ---------- отправка пользователю ----------
+# ===== ОБЩИЙ СКАН =====
 
-async def _notify_user(bot: Bot, user_id: int, deals: List[Dict[str, Any]]):
-    sent = 0
-    for d in deals:
-        if sent >= MAX_DEALS_PER_USER:
-            break
+def _passes_user_filters(deal: Dict[str, Any], st: Dict[str, Any]) -> bool:
+    """Сопоставление сделки с настройками пользователя."""
+    min_discount: Optional[float] = st.get("min_discount")
+    max_price_ton = st.get("max_price_ton")
+    collections = st.get("collections")  # может быть None или list[str]
 
-        deal_hash = _hash_deal(d)
+    # Фильтр по коллекциям
+    if collections:
+        # сравниваем friendly-адреса (в БД мы храним как есть)
+        if not any(
+            (deal.get("collection") or "").lower() == (c or "").lower()
+            for c in collections
+        ):
+            return False
+
+    # Фильтр по цене (если цена известна)
+    price = deal.get("price_ton")
+    if max_price_ton is not None and price is not None:
         try:
-            if await was_deal_seen(deal_hash):
-                continue
+            if Decimal(str(price)) > Decimal(str(max_price_ton)):
+                return False
         except Exception:
             pass
 
-        msg = _format_deal_msg(d)
+    # Фильтр по скидке (если её нет — пропускаем только если min_discount <= 0)
+    disc = deal.get("discount")
+    if disc is None:
+        return (min_discount is None) or (float(min_discount) <= 0.0)
+    else:
         try:
-            await bot.send_message(user_id, msg, disable_web_page_preview=False)
-            sent += 1
-        except Exception as e:
-            logger.warning("Send to %s failed: %s", user_id, e)
-
-        try:
-            await mark_deal_seen({
-                "deal_id": deal_hash,
-                "url": d.get("url"),
-                "collection": d.get("collection"),
-                "name": d.get("name"),
-                "price_ton": d.get("price_ton"),
-                "floor_ton": d.get("fair_price_ton") or d.get("floor_price_ton"),
-                "discount": _calc_discount_pct(d),
-            })
+            return float(disc) >= float(min_discount or 0.0)
         except Exception:
-            pass
+            return True
 
-# ---------- основной цикл ----------
+async def _notify_user(user_id: int, deal: Dict[str, Any]):
+    from aiogram import Bot
+    TOKEN = os.getenv("BOT_TOKEN", "")
+    if not TOKEN:
+        return
 
-async def scanner_tick(bot: Bot):
+    bot = Bot(TOKEN, parse_mode="HTML")
     try:
-        users = await get_scanner_users()
+        parts = []
+        parts.append(f"🧩 <b>Сигнал (dTON)</b>")
+        if deal.get("name"):
+            parts.append(f"• NFT: <code>{deal['name']}</code>")
+        if deal.get("collection"):
+            parts.append(f"• Коллекция: <code>{deal['collection']}</code>")
+        if deal.get("price_ton") is not None:
+            parts.append(f"• Цена: <b>{deal['price_ton']:.4f} TON</b>")
+        if deal.get("discount") is not None:
+            parts.append(f"• Скидка: <b>{deal['discount']:.1f}%</b>")
+        if deal.get("url"):
+            parts.append(f"\n➡️ <a href=\"{deal['url']}\">Открыть в Tonviewer</a>")
+
+        text = "\n".join(parts)
+        await bot.send_message(user_id, text, disable_web_page_preview=True)
+    finally:
+        await bot.session.close()
+
+async def _scan_once() -> None:
+    pool = await get_pool()
+
+    # собираем ордера со всех активных источников
+    batches: List[List[Dict[str, Any]]] = []
+
+    # dTON (активен)
+    try:
+        dton = await _fetch_from_dton()
+        batches.append(dton)
     except Exception as e:
-        logger.warning("get_scanner_users() failed: %s", e)
-        users = []
+        log.warning("dTON fetch failed: %s", e)
 
+    # другие источники (если включены)
+    try:
+        tonapi = await _fetch_from_tonapi_rest()
+        batches.append(tonapi)
+    except Exception as e:
+        log.warning("TonAPI REST fetch failed: %s", e)
+
+    try:
+        gg = await _fetch_from_getgems()
+        batches.append(gg)
+    except Exception as e:
+        log.warning("Getgems fetch failed: %s", e)
+
+    # плоский список и дедупликация по deal_id
+    all_items = [it for batch in batches for it in (batch or [])]
+    uniq: Dict[str, Dict[str, Any]] = {}
+    for it in all_items:
+        did = it.get("deal_id")
+        if not did:
+            continue
+        uniq[did] = it
+
+    log.info("Суммарно получено %d / уникальных %d ордеров", len(all_items), len(uniq))
+
+    if not uniq:
+        log.info("Нет активных источников или источники вернули пусто.")
+        return
+
+    users = await get_scanner_users(pool)
     if not users:
-        logger.debug("Нет включённых пользователей — тик пропущен.")
         return
 
-    all_deals = await _fetch_all_sources()
-    if not all_deals:
-        logger.info("Источники вернули пусто — сигналов нет на этом тике.")
-        return
-
-    for u in users:
-        user_id = _safe_user_id(u)
-        if not user_id:
+    for deal in uniq.values():
+        # антидубликаты на уровне БД
+        if await was_deal_seen(pool, deal["deal_id"]):
             continue
 
-        try:
-            st = await get_or_create_scanner_settings(user_id)
-        except Exception as e:
-            logger.warning("get_or_create_scanner_settings(%s) failed: %s", user_id, e)
-            continue
+        # для каждого пользователя — проверка его фильтров и отправка
+        for uid in users:
+            st = await get_or_create_scanner_settings(pool, uid)
+            if _passes_user_filters(deal, st):
+                await _notify_user(uid, deal)
 
-        filtered: List[Dict[str, Any]] = []
-        reject: Dict[str, int] = {}
-
-        for d in all_deals:
-            ok, reason = _passes_filters_with_reason(d, st)
-            if ok:
-                filtered.append(d)
-            else:
-                reject[reason] = reject.get(reason, 0) + 1
-
-        logger.info("user %s: прошло %s, отсечено %s (%s)",
-                    user_id, len(filtered), sum(reject.values()),
-                    ", ".join(f"{k}:{v}" for k, v in list(reject.items())[:5]))
-
-        if filtered:
-            await _notify_user(bot, user_id, filtered)
+        # помечаем как отправленное
+        await mark_deal_seen(pool, deal)
 
 async def scanner_loop():
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
-    logger.info("Scanner loop started")
-
-    async def _calc_sleep_default() -> int:
-        try:
-            users = await get_scanner_users()
-            mins = []
-            for u in users or []:
-                uid = _safe_user_id(u)
-                if not uid:
-                    continue
-                st = await get_or_create_scanner_settings(uid)
-                mins.append(int(st.get("poll_seconds") or 60))
-            if mins:
-                return max(10, min(mins))
-        except Exception:
-            pass
-        return DEFAULT_TICK_SECONDS
-
-    sleep_seconds = await _calc_sleep_default()
+    log.info("Scanner loop started")
     while True:
         try:
-            await scanner_tick(bot)
+            await _scan_once()
         except Exception as e:
-            logger.exception("scanner_tick crashed: %s", e)
-        try:
-            sleep_seconds = await _calc_sleep_default()
-        except Exception:
-            pass
-        await asyncio.sleep(sleep_seconds)
+            log.exception("scanner tick failed: %s", e)
+        await asyncio.sleep(POLL_SECONDS)
