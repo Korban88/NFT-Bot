@@ -37,7 +37,6 @@ CREATE TABLE IF NOT EXISTS app_scanner_settings (
     min_discount NUMERIC(5,2) NOT NULL DEFAULT 25.0,
     max_price_ton NUMERIC(32,9),
     collections TEXT[],
-    -- новые поля могут отсутствовать в уже существующей таблице — добавим их через ALTER в init_db()
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -55,29 +54,24 @@ CREATE TABLE IF NOT EXISTS app_found_deals (
 """
 
 async def get_pool() -> asyncpg.pool.Pool:
+    """Ленивая инициализация пула + миграции."""
     global _pool
     if _pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is empty")
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        await init_db()
+        # прогоняем INIT_SQL
+        async with _pool.acquire() as con:
+            await con.execute(INIT_SQL)
     return _pool
-
-async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        # Базовые таблицы
-        await con.execute(INIT_SQL)
-        # Миграции — добавляем недостающие поля, если их нет
-        await con.execute("""
-            ALTER TABLE app_scanner_settings
-                ADD COLUMN IF NOT EXISTS min_price_ton NUMERIC(32,9),
-                ADD COLUMN IF NOT EXISTS poll_seconds INTEGER NOT NULL DEFAULT 60;
-        """)
 
 # --- Settings ---
 
-async def set_wallet(address: str):
+async def set_wallet(user_id: int, address: str) -> None:
+    """
+    Сохраняем TON-адрес кошелька в глобальные настройки (id=1).
+    Параметр user_id принимаем для совместимости с хэндлерами, но не используем.
+    """
     pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
@@ -98,7 +92,7 @@ async def get_or_create_scanner_settings(user_id: int) -> Dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
-            SELECT user_id, min_discount, max_price_ton, min_price_ton, poll_seconds, collections
+            SELECT user_id, min_discount, max_price_ton, collections
             FROM app_scanner_settings WHERE user_id=$1
         """, user_id)
         if row:
@@ -107,17 +101,10 @@ async def get_or_create_scanner_settings(user_id: int) -> Dict[str, Any]:
             INSERT INTO app_scanner_settings (user_id) VALUES ($1)
             ON CONFLICT (user_id) DO NOTHING
         """, user_id)
-        # Значения по умолчанию, согласованные с схемой
-        return {
-            "user_id": user_id,
-            "min_discount": 25.0,
-            "max_price_ton": None,
-            "min_price_ton": None,
-            "poll_seconds": 60,
-            "collections": None
-        }
+        return {"user_id": user_id, "min_discount": 25.0, "max_price_ton": None, "collections": None}
 
-async def update_scanner_settings(user_id: int, **kwargs):
+async def update_scanner_settings(user_id: int, **kwargs) -> None:
+    """Динамический апдейт по полям kwargs; updated_at обновляется автоматически."""
     if not kwargs:
         return
     fields = []
@@ -135,7 +122,7 @@ async def update_scanner_settings(user_id: int, **kwargs):
 
 # --- Users ---
 
-async def set_scanner_enabled(user_id: int, enabled: bool):
+async def set_scanner_enabled(user_id: int, enabled: bool) -> None:
     pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
@@ -150,21 +137,39 @@ async def get_scanner_users() -> List[int]:
         rows = await con.fetch("SELECT user_id FROM app_users WHERE scanner_enabled=TRUE")
         return [int(r["user_id"]) for r in rows]
 
-# --- Deals ---
+# --- Deals (дедуп/лог) ---
 
-async def was_deal_seen(deal_id: str) -> bool:
+async def was_deal_seen(deal_id: str, url: Optional[str] = None) -> bool:
+    """
+    Проверяем, видели ли мы уже этот лот.
+    Дедуп по deal_id; если передан url — дополнительно по url.
+    """
     pool = await get_pool()
     async with pool.acquire() as con:
-        row = await con.fetchrow("SELECT 1 FROM app_found_deals WHERE deal_id=$1", deal_id)
+        if url:
+            row = await con.fetchrow(
+                "SELECT 1 FROM app_found_deals WHERE deal_id=$1 OR url=$2",
+                deal_id, url
+            )
+        else:
+            row = await con.fetchrow(
+                "SELECT 1 FROM app_found_deals WHERE deal_id=$1",
+                deal_id
+            )
         return row is not None
 
-async def mark_deal_seen(deal: Dict[str, Any]):
+async def mark_deal_seen(deal: Dict[str, Any]) -> None:
+    """
+    Сохраняем найденный лот. Игнорируем ЛЮБОЙ конфликт уникальности
+    (и по deal_id, и по url), чтобы не падать на дублях.
+    """
     pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute("""
-            INSERT INTO app_found_deals (deal_id, url, collection, name, price_ton, floor_ton, discount)
+            INSERT INTO app_found_deals
+                (deal_id, url, collection, name, price_ton, floor_ton, discount)
             VALUES ($1,$2,$3,$4,$5,$6,$7)
-            ON CONFLICT (deal_id) DO NOTHING
+            ON CONFLICT DO NOTHING
         """,
         deal.get("deal_id"),
         deal.get("url"),
